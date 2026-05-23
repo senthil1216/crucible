@@ -12,7 +12,7 @@ from agent.llm_clients import (
     MockLLMClient, OpenAIClient, AnthropicClient, 
     KimiClient, DeepSeekClient, OllamaClient
 )
-from agent.models import AgentConfig
+from agent.models import AgentConfig, LoopConfig
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -116,7 +116,7 @@ async def main():
     
     # Create configuration
     config = AgentConfig(
-        loop__max_iterations=args.max_iterations,
+        loop=LoopConfig(max_iterations=args.max_iterations),
         workspace_path=args.workspace
     )
     
