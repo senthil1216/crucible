@@ -1,9 +1,11 @@
 # Core dependencies
 # No strict dependencies - agent works with standard library
 
-# Optional: For cloud LLM APIs (OpenAI, Ollama, etc.)
-# openai>=1.0.0
-# httpx>=0.24.0
+# Required for Ollama client
+openai>=1.0.0
+httpx>=0.24.0
+
+# Optional: For cloud LLM APIs (OpenAI, Anthropic, etc.)
 
 # Optional: For Anthropic integration  
 # anthropic>=0.20.0
