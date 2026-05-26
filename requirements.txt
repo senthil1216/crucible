@@ -5,6 +5,10 @@
 openai>=1.0.0
 httpx>=0.24.0
 
+# Required for semantic memory (long-term + failure memory similarity)
+# Default model: all-MiniLM-L6-v2 (~80 MB, CPU-friendly)
+sentence-transformers>=2.2.0
+
 # Optional: For cloud LLM APIs (OpenAI, Anthropic, etc.)
 
 # Optional: For Anthropic integration  
