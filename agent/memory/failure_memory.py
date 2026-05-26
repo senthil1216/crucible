@@ -8,9 +8,9 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-import re
 
 from agent.models import ErrorSignature, MemoryEntry, CodeArtifact
+from agent.memory.embeddings import EmbeddingClient, cosine_similarity
 
 
 class FailureMemory:
@@ -19,10 +19,15 @@ class FailureMemory:
     Uses error signature similarity to avoid repeating mistakes.
     """
     
-    def __init__(self, storage_path: Path):
+    def __init__(
+        self,
+        storage_path: Path,
+        embedding_client: Optional[EmbeddingClient] = None,
+    ):
         self.storage_path = storage_path
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.failures_file = storage_path / "failures.jsonl"
+        self._embeddings = embedding_client or EmbeddingClient.shared()
         self._cache: List[MemoryEntry] = []
         self._load_cache()
     
@@ -66,9 +71,13 @@ class FailureMemory:
             f"{error_signature.normalize()}:{attempt.source[:100]}".encode()
         ).hexdigest()[:16]
         
+        # Embed the *raw* message (not the placeholder-heavy normalized form)
+        # so the vector retains semantic content. The normalized key is still
+        # used for exact-grouping via _extract_error_signature_key.
         content = {
             "error_signature": error_signature.to_dict(),
             "error_key": self._extract_error_signature_key(error_signature),
+            "error_embedding": self._embeddings.encode(error_signature.error_message),
             "attempt_summary": attempt.source[:500],
             "root_cause": root_cause,
             "fix": fix,
@@ -98,24 +107,20 @@ class FailureMemory:
         if not self._cache:
             return []
         
-        target_key = self._extract_error_signature_key(error_signature)
-        target_norm = error_signature.normalize()
-        
+        target_emb = self._embeddings.encode(error_signature.error_message)
+
         scored = []
         for entry in self._cache:
             entry_sig = entry.content.get("error_signature", {})
-            
+
             # Filter by error type if requested
             if same_error_type_only:
                 if entry_sig.get("error_type") != error_signature.error_type:
                     continue
-            
-            # Calculate similarity based on normalized error message
-            entry_norm = entry.content.get("error_key", "")
-            
-            # Simple string similarity
-            similarity = self._string_similarity(target_norm, entry_norm)
-            
+
+            entry_emb = self._get_embedding(entry)
+            similarity = cosine_similarity(target_emb, entry_emb)
+
             if similarity > 0.3:  # Threshold
                 scored.append((similarity, entry))
         
@@ -136,19 +141,18 @@ class FailureMemory:
         
         return results
     
-    def _string_similarity(self, s1: str, s2: str) -> float:
-        """Calculate simple similarity between two strings."""
-        # Use Jaccard similarity on word sets
-        words1 = set(s1.lower().split())
-        words2 = set(s2.lower().split())
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-        
-        return intersection / union if union > 0 else 0.0
+    def _get_embedding(self, entry: MemoryEntry) -> List[float]:
+        """Return the cached error embedding, computing it lazily for legacy entries."""
+        emb = entry.content.get("error_embedding")
+        if emb:
+            return emb
+        # Backfill in memory. Prefer the raw error_message for semantic content;
+        # fall back to error_key if the legacy entry doesn't have a signature dict.
+        sig = entry.content.get("error_signature") or {}
+        text = sig.get("error_message") or entry.content.get("error_key") or ""
+        emb = self._embeddings.encode(text) if text else []
+        entry.content["error_embedding"] = emb
+        return emb
     
     def get_common_failures(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get the most common types of failures."""
