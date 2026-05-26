@@ -13,6 +13,9 @@ httpx>=0.24.0
 # Optional: For llama.cpp local models
 # llama-cpp-python>=0.2.0
 
+# Optional: Docker-based sandbox executor (recommended for real dependency support)
+# docker>=7.0.0
+
 # Development dependencies
 pytest>=7.0.0
 pytest-asyncio>=0.21.0

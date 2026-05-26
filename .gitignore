@@ -131,6 +131,9 @@ kimi_workspace/
 .agent_memory/
 *.gguf
 
+# Agent-generated code outputs (temp directory - never commit)
+tmp/
+
 # IDE
 .vscode/
 .idea/

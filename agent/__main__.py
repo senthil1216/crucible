@@ -76,6 +76,24 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show agent statistics"
     )
+
+    parser.add_argument(
+        "--docker",
+        action="store_true",
+        help="Use Docker-based sandbox (allows installing packages like fastapi inside the container)"
+    )
+
+    parser.add_argument(
+        "--docker-image",
+        default="python:3.12-slim",
+        help="Docker image to use when --docker is enabled"
+    )
+
+    parser.add_argument(
+        "--docker-persistent",
+        action="store_true",
+        help="Use one persistent container for the whole task (enables pip install etc.)"
+    )
     
     return parser
 
@@ -117,7 +135,10 @@ async def main():
     # Create configuration
     config = AgentConfig(
         loop=LoopConfig(max_iterations=args.max_iterations),
-        workspace_path=args.workspace
+        workspace_path=args.workspace,
+        use_docker=args.docker,
+        docker_image=args.docker_image,
+        docker_persistent=args.docker_persistent,
     )
     
     # Create LLM client

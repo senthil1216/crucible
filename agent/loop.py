@@ -17,6 +17,7 @@ from agent.planner import Planner
 from agent.code_generator import CodeGenerator
 from agent.tester import Tester
 from agent.reflector import Reflector
+from agent.dependency_manager import DependencyManager  # Phase 2
 
 
 @dataclass
@@ -101,7 +102,9 @@ class ExecutionLoop:
         on_plan: Callable[[Plan], None] = None,
         on_code: Callable[[CodeArtifact], None] = None,
         on_test: Callable[[TestResults], None] = None,
-        on_reflect: Callable[[Reflection], None] = None
+        on_reflect: Callable[[Reflection], None] = None,
+        install_packages: Optional[Callable[[list[str]], bool]] = None,  # Phase 2 (legacy)
+        dependency_manager: Optional[DependencyManager] = None,          # Phase 2
     ):
         self.planner = planner
         self.code_generator = code_generator
@@ -109,6 +112,8 @@ class ExecutionLoop:
         self.reflector = reflector
         self.memory = short_term_memory
         self.config = config or LoopConfig()
+        self.install_packages = install_packages
+        self.dependency_manager = dependency_manager  # Preferred Phase 2 path
         
         # Circuit breaker
         self.circuit_breaker = CircuitBreaker(
@@ -156,10 +161,22 @@ class ExecutionLoop:
             # Check circuit breaker
             if not self.circuit_breaker.can_execute():
                 print(f"⚠️ Circuit breaker is {self.circuit_breaker.get_state()}")
+
+                # Try to surface the last real code attempt instead of an empty artifact.
+                # This makes the final summary and persisted file much more useful.
+                last_states = self.memory.get_recent(1)
+                if last_states:
+                    last = last_states[0]
+                    code_to_use = last.code
+                    plan_to_use = last.plan
+                else:
+                    code_to_use = CodeArtifact(source="", file_path="", language="python")
+                    plan_to_use = current_plan or Plan(goal=goal, steps=[], test_cases=[])
+
                 return self._create_final_state(
                     iteration=iteration - 1,
-                    plan=current_plan or Plan(goal=goal, steps=[], test_cases=[]),
-                    code=CodeArtifact(source="", file_path="", language="python"),
+                    plan=plan_to_use,
+                    code=code_to_use,
                     test_results=TestResults(passed=False, stderr="Circuit breaker opened"),
                     reflection=Reflection(
                         success=False,
@@ -265,37 +282,97 @@ class ExecutionLoop:
         previous_code = self.memory.get_last_code()
         last_reflection = self.memory.get_last_reflection()
         
+        is_multi_file = getattr(current_plan, 'use_multi_file', False)
+        
         if previous_code and last_reflection and not last_reflection.success:
             # This is a fix attempt
-            code = await self.code_generator.generate_fix(
-                plan=current_plan,
-                broken_code=previous_code,
-                error_type=last_reflection.error_signature.error_type if last_reflection.error_signature else "Unknown",
-                error_message=last_reflection.error_signature.error_message if last_reflection.error_signature else "",
-                reflection=last_reflection.analysis
-            )
+            if is_multi_file:
+                files = await self.code_generator.generate_files(
+                    plan=current_plan,
+                    previous_attempt=previous_code,
+                    error_feedback=last_reflection.suggested_fix if last_reflection else None
+                )
+                code = None  # Will use files instead
+            else:
+                code = await self.code_generator.generate_fix(
+                    plan=current_plan,
+                    broken_code=previous_code,
+                    error_type=last_reflection.error_signature.error_type if last_reflection.error_signature else "Unknown",
+                    error_message=last_reflection.error_signature.error_message if last_reflection.error_signature else "",
+                    reflection=last_reflection.analysis
+                )
+                files = None
         else:
             # Fresh generation
-            code = await self.code_generator.generate(
-                plan=current_plan,
-                previous_attempt=previous_code,
-                error_feedback=last_reflection.suggested_fix if last_reflection else None
-            )
+            if is_multi_file:
+                files = await self.code_generator.generate_files(
+                    plan=current_plan,
+                    previous_attempt=previous_code,
+                    error_feedback=last_reflection.suggested_fix if last_reflection else None
+                )
+                code = None
+            else:
+                code = await self.code_generator.generate(
+                    plan=current_plan,
+                    previous_attempt=previous_code,
+                    error_feedback=last_reflection.suggested_fix if last_reflection else None
+                )
+                files = None
         
-        print(f"Generated {len(code.source)} characters")
+        if is_multi_file and files:
+            print(f"Generated {len(files)} files")
+            # Write files to workspace if executor supports it (Phase 2)
+            if hasattr(self.tester.executor, 'write_files') and getattr(self.tester.executor, 'persistent', False):
+                self.tester.executor.write_files(files)
+                print(f"Written {len(files)} files to workspace")
+            # Multi-file mode: write files to workspace and create a representative CodeArtifact
+            first_file = next(iter(files))
+            code = CodeArtifact(
+                source=files[first_file],
+                file_path=first_file,
+                language=current_plan.language,
+                metadata={"generated_files": list(files.keys())}
+            )
+        elif code:
+            print(f"Generated {len(code.source)} characters")
         
         if self.on_code:
             self.on_code(code)
         
         # PHASE 3: TEST
         print("\n[TEST] Running tests...")
-        test_results = await self.tester.run_tests(code, current_plan)
+        test_results = await self.tester.run_tests(
+            code, 
+            current_plan, 
+            run_from_workspace=is_multi_file
+        )
         print(f"Passed: {test_results.passed}")
         
         if not test_results.passed:
             print(f"Error: {test_results.error_type}")
             if test_results.stderr:
                 print(f"Details: {test_results.stderr[:200]}...")
+            
+            # Phase 2: Automatic package installation recovery
+            if self.dependency_manager and test_results.error_type in ("ModuleNotFoundError", "ImportError"):
+                if self.dependency_manager.should_attempt_recovery(test_results.stderr):
+                    recovery = self.dependency_manager.handle_import_error(test_results.stderr, code.source)
+                    if recovery.attempted:
+                        if recovery.success:
+                            print(f"Successfully installed {recovery.packages_installed}. Retrying execution...")
+                            test_results = await self.tester.run_tests(code, current_plan)
+                            print(f"Retry Passed: {test_results.passed}")
+                        else:
+                            print(f"Package installation failed: {recovery.error}")
+            # Legacy fallback (if no DependencyManager is wired)
+            elif self.install_packages and test_results.error_type in ("ModuleNotFoundError", "ImportError"):
+                package = self._extract_package_name(test_results.stderr)
+                if package:
+                    print(f"Attempting to install missing package: {package}")
+                    if self.install_packages([package]):
+                        print(f"Successfully installed {package}. Retrying execution...")
+                        test_results = await self.tester.run_tests(code, current_plan)
+                        print(f"Retry Passed: {test_results.passed}")
         
         if self.on_test:
             self.on_test(test_results)
@@ -397,3 +474,20 @@ class ExecutionLoop:
             "circuit_breaker_state": self.circuit_breaker.get_state(),
             "error_history": self.memory.get_error_history()
         }
+
+    def _extract_package_name(self, stderr: str) -> Optional[str]:
+        """
+        Legacy method - kept only for fallback path.
+        New code should use DependencyManager.extract_packages_from_error() instead.
+        """
+        if not stderr:
+            return None
+
+        import re
+        match = re.search(r"No module named ['\"]([^'\"]+)['\"]", stderr)
+        if match:
+            name = match.group(1).split(".")[0]
+            if name in {"os", "sys", "re", "json", "time", "pathlib"}:
+                return None
+            return name
+        return None

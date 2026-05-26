@@ -35,6 +35,10 @@ class Plan:
     language: str = "python"
     dependencies: List[str] = field(default_factory=list)
     context: Dict[str, Any] = field(default_factory=dict)
+
+    # Phase 2: Multi-file / workspace support
+    project_type: str = "general"       # e.g. "fastapi", "python_package", "cli_tool", "general"
+    use_multi_file: bool = False        # Whether this task should generate multiple files
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -43,7 +47,9 @@ class Plan:
             "test_cases": self.test_cases,
             "language": self.language,
             "dependencies": self.dependencies,
-            "context": self.context
+            "context": self.context,
+            "project_type": self.project_type,
+            "use_multi_file": self.use_multi_file,
         }
     
     @classmethod
@@ -254,6 +260,15 @@ class AgentConfig:
     sandbox_timeout: int = 30
     sandbox_memory_limit: str = "512m"
     sandbox_cpu_limit: float = 1.0
+
+    # Docker sandbox settings (Phase 1+)
+    use_docker: bool = False
+    docker_image: str = "python:3.12-slim"
+
+    # Phase 2 Persistent Docker settings
+    docker_persistent: bool = False          # One container per task instead of ephemeral
+    docker_enable_network: bool = True       # Needed for pip install etc. in persistent mode
+    docker_install_build_tools: bool = True  # Install build-essential etc. on persistent start
     
     # LLM settings
     llm_model: str = "gpt-4"
