@@ -132,6 +132,12 @@ class LongTermMemory:
 
         return pattern_id
 
+    # Phase C: multi-signal scoring weights. Tuned so that semantic similarity
+    # remains the dominant signal, with structured matches as tiebreakers /
+    # boosts. Adjust if calibration data warrants.
+    _PROJECT_TYPE_BONUS = 0.15
+    _DEPENDENCY_BONUS_MAX = 0.10
+
     async def find_similar_solutions(
         self,
         goal: str,
@@ -139,18 +145,26 @@ class LongTermMemory:
         min_similarity: float = 0.3,
         project_type: Optional[str] = None,
         dependencies: Optional[List[str]] = None,
+        strict_filters: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Find similar past solutions, scored by goal-embedding cosine similarity
-        and optionally filtered by `project_type` and `dependencies` overlap.
+        Find similar past solutions using multi-signal scoring.
+
+        Final score = semantic cosine similarity + project_type bonus +
+        dependency-overlap bonus. Structured matches boost ranking but do not
+        exclude entries by default — pass `strict_filters=True` to restore the
+        old hard-filter behavior.
 
         Args:
             goal: free-text goal for the new task
             k: maximum results to return
-            min_similarity: cosine threshold (0..1); entries below are dropped
-            project_type: if provided, only entries with the same project_type
-            dependencies: if provided, only entries whose stored dependencies
-                intersect this list (any overlap qualifies)
+            min_similarity: lower bound applied to the *final* multi-signal
+                score; entries below are dropped
+            project_type: when matched, boosts score by _PROJECT_TYPE_BONUS
+            dependencies: each overlapping dep adds proportional bonus, up to
+                _DEPENDENCY_BONUS_MAX
+            strict_filters: if True, project_type / dependencies act as hard
+                filters (used by callers that explicitly want exclusion)
         """
 
         if not self._cache:
@@ -161,26 +175,42 @@ class LongTermMemory:
 
         scored: List[tuple] = []
         for entry in self._cache:
-            if project_type and entry.content.get("project_type") != project_type:
-                continue
+            entry_project_type = entry.content.get("project_type")
+            stored_deps = set(entry.content.get("dependencies") or [])
 
-            if dep_filter:
-                stored_deps = set(entry.content.get("dependencies") or [])
-                if not (stored_deps & dep_filter):
+            if strict_filters:
+                if project_type and entry_project_type != project_type:
+                    continue
+                if dep_filter and not (stored_deps & dep_filter):
                     continue
 
             entry_emb = self._get_embedding(entry)
-            similarity = cosine_similarity(query_emb, entry_emb)
-            if similarity >= min_similarity:
-                scored.append((similarity, entry))
+            base = cosine_similarity(query_emb, entry_emb)
+
+            score = base
+            if project_type and entry_project_type == project_type:
+                score += self._PROJECT_TYPE_BONUS
+            if dep_filter and stored_deps:
+                overlap = len(stored_deps & dep_filter)
+                # Bonus scales with overlap fraction of the query's dependency
+                # list, capped at _DEPENDENCY_BONUS_MAX.
+                bonus = min(
+                    self._DEPENDENCY_BONUS_MAX,
+                    self._DEPENDENCY_BONUS_MAX * (overlap / max(len(dep_filter), 1)),
+                )
+                score += bonus
+
+            if score >= min_similarity:
+                scored.append((score, base, entry))
 
         scored.sort(reverse=True, key=lambda x: x[0])
 
         results: List[Dict[str, Any]] = []
-        for score, entry in scored[:k]:
+        for score, base, entry in scored[:k]:
             results.append({
                 "id": entry.id,
-                "similarity": score,
+                "similarity": score,             # multi-signal score
+                "base_similarity": base,         # raw semantic cosine
                 "goal": entry.content["goal"],
                 "plan": entry.content["plan"],
                 "code": entry.content["code"],

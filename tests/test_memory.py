@@ -183,7 +183,8 @@ class TestLongTermMemory:
         assert results[0]["similarity"] > 0
 
     @pytest.mark.asyncio
-    async def test_filter_by_project_type(self, temp_dir, fake_embeddings):
+    async def test_project_type_boost_ranks_matching_first(self, temp_dir, fake_embeddings):
+        """Soft-signal scoring: matching project_type boosts rank, not exclusion."""
         memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
 
         web_plan = Plan(
@@ -201,20 +202,18 @@ class TestLongTermMemory:
         await memory.store_pattern("build a web app", web_plan, code)
         await memory.store_pattern("build a web app", cli_plan, code)
 
-        only_web = await memory.find_similar_solutions(
+        ranked = await memory.find_similar_solutions(
             "build a web app", k=5, min_similarity=0.0, project_type="fastapi"
         )
-        assert len(only_web) == 1
-        assert only_web[0]["project_type"] == "fastapi"
-
-        only_cli = await memory.find_similar_solutions(
-            "build a web app", k=5, min_similarity=0.0, project_type="cli_tool"
-        )
-        assert len(only_cli) == 1
-        assert only_cli[0]["project_type"] == "cli_tool"
+        # Both come back; fastapi ranks first because of the project_type bonus.
+        assert len(ranked) == 2
+        assert ranked[0]["project_type"] == "fastapi"
+        assert ranked[1]["project_type"] == "cli_tool"
+        assert ranked[0]["similarity"] > ranked[0]["base_similarity"]
+        assert ranked[1]["similarity"] == ranked[1]["base_similarity"]
 
     @pytest.mark.asyncio
-    async def test_filter_by_dependencies(self, temp_dir, fake_embeddings):
+    async def test_dependency_overlap_boost_ranks_matching_first(self, temp_dir, fake_embeddings):
         memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
 
         fastapi_plan = Plan(
@@ -232,14 +231,33 @@ class TestLongTermMemory:
         await memory.store_pattern("serve an endpoint", fastapi_plan, code)
         await memory.store_pattern("serve an endpoint", flask_plan, code)
 
-        results = await memory.find_similar_solutions(
+        ranked = await memory.find_similar_solutions(
             "serve an endpoint",
             k=5,
             min_similarity=0.0,
             dependencies=["fastapi"],
         )
-        assert len(results) == 1
-        assert "fastapi" in results[0]["dependencies"]
+        # Both come back; the fastapi entry ranks first because of overlap.
+        assert len(ranked) == 2
+        assert "fastapi" in ranked[0]["dependencies"]
+        assert "flask" in ranked[1]["dependencies"]
+
+    @pytest.mark.asyncio
+    async def test_strict_filters_restore_exclusion(self, temp_dir, fake_embeddings):
+        """strict_filters=True keeps the old hard-filter behavior."""
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        a = Plan(goal="g", steps=[], test_cases=[], language="python", project_type="fastapi")
+        b = Plan(goal="g", steps=[], test_cases=[], language="python", project_type="cli_tool")
+        code = CodeArtifact(source="x = 1", file_path="x.py", language="python")
+        await memory.store_pattern("g", a, code)
+        await memory.store_pattern("g", b, code)
+
+        only = await memory.find_similar_solutions(
+            "g", k=5, min_similarity=0.0, project_type="fastapi", strict_filters=True
+        )
+        assert len(only) == 1
+        assert only[0]["project_type"] == "fastapi"
 
     @pytest.mark.asyncio
     async def test_legacy_entry_without_embedding(self, temp_dir, fake_embeddings):

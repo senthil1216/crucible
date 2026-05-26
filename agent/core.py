@@ -234,13 +234,19 @@ class SelfImprovingAgent:
                 if resume_from:
                     print(f"📂 Resuming from iteration {resume_from.iteration}")
             
-            # Retrieve similar solutions from long-term memory
+            # Retrieve similar solutions and relevant learnings from long-term memory
             similar_solutions = await self.long_term_memory.find_similar_solutions(goal, k=2)
             if similar_solutions:
                 print(f"📚 Found {len(similar_solutions)} similar past solutions")
-            
+
+            relevant_learnings = await self.long_term_memory.find_relevant_learnings(goal, k=3)
+            if relevant_learnings:
+                print(f"📘 Surfaced {len(relevant_learnings)} relevant learning(s)")
+
             # Pre-planning with retrieved memories
-            plan = await self.planner.create_plan(goal, similar_solutions)
+            plan = await self.planner.create_plan(
+                goal, similar_solutions, relevant_learnings=relevant_learnings
+            )
             
             # Run the execution loop
             final_state = await self.loop.run(
