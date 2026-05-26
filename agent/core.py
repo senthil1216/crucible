@@ -234,13 +234,19 @@ class SelfImprovingAgent:
                 if resume_from:
                     print(f"📂 Resuming from iteration {resume_from.iteration}")
             
-            # Retrieve similar solutions from long-term memory
+            # Retrieve similar solutions and relevant learnings from long-term memory
             similar_solutions = await self.long_term_memory.find_similar_solutions(goal, k=2)
             if similar_solutions:
                 print(f"📚 Found {len(similar_solutions)} similar past solutions")
-            
+
+            relevant_learnings = await self.long_term_memory.find_relevant_learnings(goal, k=3)
+            if relevant_learnings:
+                print(f"📘 Surfaced {len(relevant_learnings)} relevant learning(s)")
+
             # Pre-planning with retrieved memories
-            plan = await self.planner.create_plan(goal, similar_solutions)
+            plan = await self.planner.create_plan(
+                goal, similar_solutions, relevant_learnings=relevant_learnings
+            )
             
             # Run the execution loop
             final_state = await self.loop.run(
@@ -315,6 +321,16 @@ class SelfImprovingAgent:
         
         # Store successful pattern in long-term memory
         if state.status == Status.SUCCESS:
+            # Phase D: snapshot the executor's environment (installed packages,
+            # workspace files) when available. Best-effort — defaults to {}
+            # for executors that don't expose capture_environment.
+            env_ctx = {}
+            if hasattr(self.sandbox, "capture_environment"):
+                try:
+                    env_ctx = self.sandbox.capture_environment() or {}
+                except Exception as e:
+                    print(f"⚠️  capture_environment failed (non-fatal): {e}")
+
             await self.long_term_memory.store_pattern(
                 goal=goal,
                 plan=state.plan,
@@ -322,9 +338,25 @@ class SelfImprovingAgent:
                 metadata={
                     "iterations": state.iteration,
                     "task_id": task_id
-                }
+                },
+                environment_context=env_ctx,
             )
             print(f"💾 Stored successful pattern in long-term memory")
+
+            # Phase B: ask the Reflector to extract reusable lessons and persist them.
+            # Best-effort — failures here must not break the success path.
+            try:
+                learnings = await self.reflector.extract_learnings(
+                    plan=state.plan,
+                    code=state.code,
+                    task_id=task_id,
+                )
+                for learning in learnings:
+                    await self.long_term_memory.store_learning(learning)
+                if learnings:
+                    print(f"📘 Stored {len(learnings)} learning(s) from reflection")
+            except Exception as e:
+                print(f"⚠️  Learning extraction failed (non-fatal): {e}")
         
         # Clean up old checkpoints
         await self.state_manager.cleanup_old_checkpoints(task_id, keep_last=3)

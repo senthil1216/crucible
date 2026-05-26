@@ -383,6 +383,44 @@ class DockerExecutor:
         """
         return self.run_command_in_workspace(command)
 
+    def capture_environment(self) -> dict:
+        """
+        Snapshot the persistent container's environment at this moment.
+
+        Returns a dict with:
+          - installed_packages: list[str] (pip names, no versions for stability)
+          - workspace_files: list[str] (file paths relative to workspace root,
+            shallow listing — top-level entries only)
+
+        Used by LongTermMemory to attach env context to successful patterns.
+        Returns an empty payload if no persistent container is active.
+        """
+        empty = {"installed_packages": [], "workspace_files": []}
+        if not self.persistent or not self._persistent_container:
+            return empty
+
+        # Installed packages via `pip list --format=freeze` — strip versions
+        # so retrieval bonuses are stable across point releases.
+        packages: List[str] = []
+        try:
+            exit_code, stdout, _ = self.run_command_in_workspace("pip list --format=freeze")
+            if exit_code == 0 and stdout:
+                for line in stdout.splitlines():
+                    if "==" in line:
+                        name = line.split("==", 1)[0].strip().lower()
+                        if name:
+                            packages.append(name)
+        except Exception as e:
+            self._log(f"capture_environment: pip list failed: {e}", level="warning")
+
+        # Workspace files (top level only — keeps the snapshot small)
+        files = self.list_dir(".")
+
+        return {
+            "installed_packages": packages,
+            "workspace_files": files,
+        }
+
     def write_files(self, files: dict[str, str]) -> bool:
         """
         Write multiple files at once (very useful for multi-file generation).

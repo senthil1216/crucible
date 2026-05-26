@@ -1,58 +1,73 @@
-# Crucible - Self-Improving Coding Agent
+# Crucible — Self-Improving Coding Agent
 
-An autonomous coding agent that writes code, runs tests, and learns from failures. Uses a **Plan → Execute → Test → Reflect** loop with memory hierarchy and safety guardrails.
+An autonomous coding agent that writes code, runs tests, and learns from its successes and failures. Built around a **Plan → Execute → Test → Reflect** loop with an embedding-backed memory hierarchy.
 
-> **crucible** /ˈkruːsɪb(ə)l/ - *noun* - A place or situation in which different elements interact to produce something new.
+> **crucible** /ˈkruːsɪb(ə)l/ — *noun* — A place or situation in which different elements interact to produce something new.
 
 ```
 User Goal → [Plan] → [Execute] → [Test] → [Reflect] → Success?
                 ↑_________________________________________|
+                          ↓ on success
+                    Pattern + Learnings + Env Context
+                          ↓
+                     Long-Term Memory
 ```
 
 ## ✨ Key Features
 
-- **🔄 Self-Improving Loop**: Automatically iterates on failures until success or max attempts
-- **🧠 Memory Hierarchy**: Short-term context, long-term pattern storage, and failure memory
-- **🛡️ Safety First**: Multi-layer safety with AST analysis, sandboxed execution, and resource limits
-- **🤖 Multi-LLM Support**: Works with OpenAI, Anthropic, Kimi, Ollama (local), and custom providers
-- **💾 State Persistence**: Resume tasks after interruptions
-- **📊 Observable**: Callbacks for monitoring progress and iterations
+- **🔄 Self-Improving Loop**: iterates on failures until success or max attempts
+- **🧠 Embedding-Backed Memory**: short-term context, semantic long-term patterns, failure memory, structured Learnings extracted on success
+- **📦 Multi-File Workspace**: optional persistent Docker container per task with file read/write, multi-file generation, and automatic dependency recovery via `DependencyManager`
+- **🤖 Multi-LLM Support**: OpenAI, Anthropic, Kimi, DeepSeek, Ollama (local), or any custom `LLMClient`
+- **💾 State Persistence**: checkpoints after every iteration; resume after interruption
+- **📊 Observable**: callbacks for plan, code, test, reflect, and iteration events
+
+> Crucible is an exploratory prototype, not a production agent. The non-Docker sandbox is *ergonomic isolation*, not a security boundary — see [Sandbox honesty](#sandbox-honesty) below.
 
 ## 🚀 Quick Start
 
-### Option 1: Local LLM (Free, Private, Offline)
+### Option 1: Local LLM (free, private, offline)
 
 ```bash
-# 1. Clone and setup
 git clone <repo>
 cd crucible
-./setup_local_llm.sh  # Installs Ollama + qwen2.5-coder:7b
+./setup_local_llm.sh             # installs Ollama + qwen2.5-coder:7b
+pip install -r requirements.txt  # pulls sentence-transformers (~80 MB model
+                                 # downloads on first run)
 
-# 2. Start Ollama (in another terminal)
-ollama serve
+ollama serve                     # in another terminal
 
-# 3. Run the agent
 python -m agent "Create a function to calculate fibonacci numbers" --llm ollama
 ```
 
-### Option 2: Cloud LLM (OpenAI, Anthropic, Kimi)
+### Option 2: Cloud LLM (OpenAI, Anthropic, Kimi, DeepSeek)
 
 ```bash
-# 1. Clone and install
 git clone <repo>
 cd crucible
-pip install -r requirements.txt  # + optional: openai, anthropic, httpx
+pip install -r requirements.txt  # includes sentence-transformers
+# optional, for the corresponding providers:
+#   pip install anthropic
 
-# 2. Set API key
 export OPENAI_API_KEY="sk-..."
 # or: export ANTHROPIC_API_KEY="sk-ant-..."
-# or: export KIMI_API_KEY="your-kimi-key"
+# or: export KIMI_API_KEY="..." / DEEPSEEK_API_KEY="..."
 
-# 3. Run the agent
 python -m agent "Create a REST API" --llm openai --model gpt-4
 ```
 
-### Python Usage
+### Option 3: Persistent Docker workspace (multi-file projects)
+
+```bash
+pip install docker
+
+python -m agent "Build a FastAPI app with /health and /items endpoints" \
+  --llm ollama --docker --docker-persistent
+```
+
+This starts one container for the whole task, lets the agent create multiple files in `/workspace/<task_id>/`, and uses `DependencyManager` to install missing packages automatically (up to 4 attempts).
+
+### Python usage
 
 ```python
 import asyncio
@@ -60,20 +75,13 @@ from agent import SelfImprovingAgent, AgentConfig
 from agent.llm_clients import OllamaClient
 
 async def main():
-    # Use local LLM (free, private)
     llm = OllamaClient(model="qwen2.5-coder:7b")
-    
-    # Or use cloud LLM
-    # from agent.llm_clients import OpenAIClient
-    # llm = OpenAIClient(api_key="sk-...", model="gpt-4")
-    
     agent = SelfImprovingAgent(
         llm_client=llm,
-        config=AgentConfig(workspace_path="./workspace")
+        config=AgentConfig(workspace_path="./workspace"),
     )
-    
+
     result = await agent.solve("Create a function to check if a number is prime")
-    
     if result.status.value == "success":
         print(result.code.source)
 
@@ -84,41 +92,39 @@ asyncio.run(main())
 
 ```
 crucible/
-├── agent/                      # Main agent package
-│   ├── __init__.py            # Main exports (SelfImprovingAgent, AgentConfig)
-│   ├── __main__.py            # CLI entry point
-│   ├── core.py                # Agent orchestrator
-│   ├── models.py              # Data models (Plan, CodeArtifact, etc.)
-│   ├── loop.py                # Execution loop + circuit breaker
-│   ├── planner.py             # Plan generation
-│   ├── code_generator.py      # Code generation
-│   ├── tester.py              # Test runner
-│   ├── reflector.py           # Failure analysis
-│   ├── persistence.py         # State persistence
-│   ├── llm_clients.py         # LLM implementations (OpenAI, Anthropic, Ollama, etc.)
-│   ├── memory/                # Memory hierarchy
-│   │   ├── short_term.py      # Rolling window (last 5 iterations)
-│   │   ├── long_term.py       # Successful pattern storage
-│   │   └── failure_memory.py  # Error signatures + fixes
-│   ├── executor/              # Sandboxed execution
-│   │   └── sandbox.py
-│   └── safety/                # Safety checks
-│       └── checker.py
-├── examples/                   # Usage examples
-│   ├── basic_usage.py
-│   ├── with_openai.py
-│   ├── with_kimi.py
-│   ├── with_ollama.py
-│   └── interactive_demo.py
-├── tests/                      # Test suite
-│   ├── test_memory.py
-│   ├── test_safety.py
-│   ├── test_loop.py
-│   └── test_integration.py
-├── ARCHITECTURE.md             # Detailed architecture docs
-├── LOCAL_LLM_GUIDE.md          # Local LLM setup guide (Ollama, etc.)
-├── KIMI_SETUP.md               # Kimi (Moonshot AI) setup guide
-├── setup_local_llm.sh          # Automated setup script for local LLMs
+├── agent/                       # Main package
+│   ├── __init__.py             # Public exports
+│   ├── __main__.py             # CLI entry point
+│   ├── core.py                 # Orchestrator (SelfImprovingAgent)
+│   ├── models.py               # Plan, CodeArtifact, Learning, etc.
+│   ├── loop.py                 # Execution loop + circuit breaker
+│   ├── planner.py              # Plan generation; surfaces past Learnings
+│   ├── code_generator.py       # Single-file + multi-file code generation
+│   ├── tester.py               # Test runner (sandbox or workspace mode)
+│   ├── reflector.py            # Failure analysis + Learning extraction
+│   ├── persistence.py          # State checkpointing
+│   ├── dependency_manager.py   # Automatic pip recovery (persistent Docker)
+│   ├── llm_clients.py          # Mock, OpenAI, Anthropic, Kimi, DeepSeek, Ollama
+│   ├── memory/
+│   │   ├── short_term.py       # Rolling window (last 5 iterations)
+│   │   ├── long_term.py        # Patterns + Learnings, semantic + multi-signal
+│   │   ├── failure_memory.py   # Error signatures + proven fixes, semantic
+│   │   └── embeddings.py       # Shared EmbeddingClient (all-MiniLM-L6-v2)
+│   ├── executor/
+│   │   ├── sandbox.py          # Local subprocess executor
+│   │   └── docker_executor.py  # Docker-based, optional persistent mode
+│   └── safety/
+│       └── checker.py          # AST-based static analysis
+├── docs/                        # Design documents
+│   ├── phase1-dependency-recovery-design.md
+│   ├── phase2-workspace-design.md
+│   └── long-term-memory-improvements-design.md
+├── examples/                    # Usage examples
+├── tests/                       # Test suite (52 tests)
+├── ARCHITECTURE.md
+├── LOCAL_LLM_GUIDE.md
+├── KIMI_SETUP.md
+├── setup_local_llm.sh
 └── requirements.txt
 ```
 
@@ -126,39 +132,43 @@ crucible/
 
 | Provider | Setup | Best For | Cost |
 |----------|-------|----------|------|
-| **Ollama** (Local) | `ollama pull qwen2.5-coder:7b` | Privacy, offline, free | Free |
-| **OpenAI** | `export OPENAI_API_KEY=...` | Complex tasks, high quality | Pay-per-use |
+| **Ollama** (Local) | `ollama pull qwen2.5-coder:7b` | Privacy, offline | Free |
+| **OpenAI** | `export OPENAI_API_KEY=...` | Quality, breadth | Pay-per-use |
 | **Anthropic** | `export ANTHROPIC_API_KEY=...` | Long context, reasoning | Pay-per-use |
-| **Kimi** | `export KIMI_API_KEY=...` | Chinese, cost-effective | Competitive |
+| **Kimi** (Moonshot) | `export KIMI_API_KEY=...` | Long context, cost | Competitive |
+| **DeepSeek** | `export DEEPSEEK_API_KEY=...` | Code-focused | Competitive |
 
-### CLI Examples
+### CLI examples
 
 ```bash
 # Local LLM (Ollama)
 python -m agent "Sort a list" --llm ollama --model qwen2.5-coder:7b
 
-# OpenAI
+# Cloud LLMs
 python -m agent "Create a REST API" --llm openai --model gpt-4
-
-# Anthropic
 python -m agent "Build a web scraper" --llm anthropic --model claude-3-opus
-
-# Kimi
 python -m agent "Create a calculator" --llm kimi --model moonshot-v1-32k
+python -m agent "Refactor this module" --llm deepseek
+
+# Docker isolation (ephemeral container per execution)
+python -m agent "Sort a list" --llm ollama --docker
+
+# Persistent Docker (one container per task, multi-file workspace,
+# automatic pip recovery)
+python -m agent "Build a FastAPI service" --llm ollama --docker --docker-persistent
 
 # Interactive mode
 python -m agent --interactive --llm ollama
 ```
 
-### Custom LLM Client
+### Custom LLM client
 
 ```python
 from agent.models import LLMClient
 
 class MyLLM(LLMClient):
     async def complete(self, prompt, system=None, temperature=0.7):
-        # Your implementation
-        return response
+        return await your_backend(prompt, system, temperature)
 
 agent = SelfImprovingAgent(llm_client=MyLLM())
 ```
@@ -167,41 +177,60 @@ agent = SelfImprovingAgent(llm_client=MyLLM())
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           AGENT ORCHESTRATOR                            │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────┐ │
-│  │   PLANNER   │───▶│   EXECUTOR  │───▶│    TESTER   │───▶│ REFLECTOR│ │
-│  │             │    │             │    │             │    │          │ │
-│  │ Break goal  │    │ Write code  │    │ Run tests   │    │ Analyze  │ │
-│  │ into steps  │    │ in sandbox  │    │ & validate  │    │ failures │ │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └────┬─────┘ │
-│       ▲─────────────────────────────────────────────────────────┘       │
-│       │ (Loop back with learnings)                                      │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-              ┌─────────────────────┼─────────────────────┐
+│                          AGENT ORCHESTRATOR                             │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────┐  │
+│  │   PLANNER   │───▶│   EXECUTOR  │───▶│    TESTER   │───▶│ REFLECTOR│  │
+│  │             │    │             │    │             │    │          │  │
+│  │ Break goal  │    │ Write code  │    │ Run tests   │    │ Analyze  │  │
+│  │ + use past  │    │ (single or  │    │ in sandbox  │    │ failures │  │
+│  │  Learnings  │    │  multi-file)│    │ / workspace │    │ + emit   │  │
+│  └─────────────┘    └─────────────┘    └─────────────┘    │ Learnings│  │
+│       ▲─────────────────────────────────────────────────────└────┬─────┘│
+│       │ (Loop back with fix suggestion)                          │      │
+└──────────────────────────────────────────────────────────────────│──────┘
+                                                                   │
+              ┌─────────────────────┬─────────────────────┬────────┘
               ▼                     ▼                     ▼
         ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-        │  SHORT-TERM │      │   LONG-TERM │      │   FAILURE   │
-        │    MEMORY   │      │    MEMORY   │      │    MEMORY   │
-        │  (Context)  │      │  (Patterns) │      │  (Mistakes) │
+        │  SHORT-TERM │      │  LONG-TERM  │      │   FAILURE   │
+        │   MEMORY    │      │   MEMORY    │      │   MEMORY    │
+        │             │      │             │      │             │
+        │  (Context)  │      │ Patterns +  │      │ Errors +    │
+        │             │      │ Learnings   │      │ proven fixes│
         └─────────────┘      └─────────────┘      └─────────────┘
 ```
 
-### Memory System
+### Memory system
 
-| Type | Purpose | Retention |
-|------|---------|-----------|
-| **Short-Term** | Recent iteration context | Last 5 iterations |
-| **Long-Term** | Successful solution patterns | Persistent |
-| **Failure** | Error signatures + proven fixes | Persistent |
+| Type | Stored | Retrieval | Persistence |
+|------|--------|-----------|-------------|
+| **Short-Term** | Recent iteration states | Direct lookup | Last 5 iterations |
+| **Long-Term — Patterns** | `(goal, plan, code, project_type, dependencies, env_context, goal_embedding)` | Semantic cosine (`all-MiniLM-L6-v2`) + multi-signal bonuses for `project_type`, deps, and installed-package overlap | `patterns.jsonl` |
+| **Long-Term — Learnings** | Short, reusable lessons extracted by the Reflector on success | Semantic cosine, filterable by `project_type` / `language` (`"general"` matches any project) | `learnings.jsonl` |
+| **Failure** | Error signature + raw message + proven fix | Semantic cosine over the raw `error_message` | `failures.jsonl` |
 
-### Safety Layers
+Multi-signal scoring (Phase C/D): semantic similarity is the dominant signal; matching `project_type` adds **+0.15**, dependency overlap adds **up to +0.10**, installed-package overlap adds **up to +0.10**. Pass `strict_filters=True` if you want the structured fields to behave as hard filters instead of bonuses.
 
-1. **Static Analysis**: AST-based analysis detects dangerous operations
-2. **Pattern Detection**: Flags `eval`, `exec`, `__import__`, etc.
-3. **Sandbox**: Resource limits (CPU, memory, time)
-4. **Filesystem Restrictions**: Isolated temp directory
-5. **Network Controls**: Disabled by default
+### Sandbox honesty
+
+The default `SandboxedExecutor` runs generated code in a subprocess with `resource.setrlimit` and AST-based static analysis. This is **ergonomic isolation, not a security boundary**:
+
+- macOS `RLIMIT_AS` and its fallbacks are no-ops; memory caps don't actually bind.
+- The AST walker only inspects direct `ast.Call` nodes — aliased calls (`o = open; o(...)`), import aliasing (`import subprocess as s`), and `getattr`-based access all bypass it.
+- The subprocess inherits filesystem and network capabilities; "network disabled" is enforced only by static analysis, not at runtime.
+
+For stronger isolation, use `--docker` (ephemeral container per execution) or `--docker-persistent` (one container per task with a dedicated `/workspace/<task_id>/`). Even Docker mode is a process boundary, not a security one — don't run untrusted goals against it.
+
+## 🗂 Multi-file workspace
+
+In persistent Docker mode, the agent can generate small projects instead of single scripts:
+
+```bash
+python -m agent "Build a FastAPI app with health + items endpoints" \
+  --llm ollama --docker --docker-persistent
+```
+
+The container exposes `write_file`, `read_file`, `list_dir`, `create_directory`, and `run_command_in_workspace` via `DockerExecutor`. `DependencyManager` watches for `ModuleNotFoundError` and reinstalls missing packages (up to 4 attempts per task) before handing off to the Reflector. Design notes in [`docs/phase1-dependency-recovery-design.md`](docs/phase1-dependency-recovery-design.md) and [`docs/phase2-workspace-design.md`](docs/phase2-workspace-design.md).
 
 ## ⚙️ Configuration
 
@@ -209,76 +238,73 @@ agent = SelfImprovingAgent(llm_client=MyLLM())
 from agent import AgentConfig, LoopConfig
 
 config = AgentConfig(
-    # Loop settings
     loop=LoopConfig(
-        max_iterations=10,        # Max attempts per task
-        failure_threshold=3,       # Circuit breaker threshold
+        max_iterations=10,
+        failure_threshold=3,
         failure_window=5,
-        cooldown_period=60
+        cooldown_period=60,
     ),
-    
-    # Paths
+
     workspace_path="./workspace",
     state_path="./.agent_state",
     memory_path="./.agent_memory",
-    
-    # Sandbox settings
-    enable_sandbox=True,
+
+    # Local subprocess sandbox (default)
     sandbox_timeout=30,
     sandbox_memory_limit="512m",
-    
-    # LLM settings
-    llm_temperature=0.7
+
+    # Docker mode (opt-in)
+    use_docker=False,
+    docker_image="python:3.12-slim",
+    docker_persistent=False,           # One container per task
+    docker_enable_network=True,        # Needed for pip in persistent mode
+    docker_install_build_tools=True,   # apt-get build-essential on container start
 )
 ```
 
 ## 🧪 Testing
 
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
+pytest                       # 52 tests
 pytest --cov=agent
-
-# Run specific test file
-pytest tests/test_loop.py -v
+pytest tests/test_memory.py -v
 ```
 
 ## 📊 Monitoring
 
-Track progress with callbacks:
-
 ```python
 def on_iteration(state):
-    print(f"Iteration {state.iteration}: {state.status}")
-
-def on_code(code):
-    print(f"Generated {len(code.source)} characters")
+    print(f"Iter {state.iteration}: {state.status}")
 
 agent = SelfImprovingAgent(
     llm_client=llm,
     callbacks={
-        'on_iteration': on_iteration,
-        'on_plan': on_plan,
-        'on_code': on_code,
-        'on_test': on_test,
-        'on_reflect': on_reflect
-    }
+        "on_iteration": on_iteration,
+        "on_plan": ...,
+        "on_code": ...,
+        "on_test": ...,
+        "on_reflect": ...,
+    },
 )
 ```
 
 ## 📚 Documentation
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Detailed architecture and design decisions
-- **[LOCAL_LLM_GUIDE.md](LOCAL_LLM_GUIDE.md)** - Complete guide for running local LLMs (Ollama, LM Studio, etc.)
-- **[KIMI_SETUP.md](KIMI_SETUP.md)** - Setup guide for Kimi (Moonshot AI)
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — Architecture and design decisions
+- [`LOCAL_LLM_GUIDE.md`](LOCAL_LLM_GUIDE.md) — Local LLM setup (Ollama, LM Studio, etc.)
+- [`KIMI_SETUP.md`](KIMI_SETUP.md) — Kimi (Moonshot AI) setup
+- [`docs/phase1-dependency-recovery-design.md`](docs/phase1-dependency-recovery-design.md) — Dependency recovery design
+- [`docs/phase2-workspace-design.md`](docs/phase2-workspace-design.md) — Multi-file workspace design
+- [`docs/long-term-memory-improvements-design.md`](docs/long-term-memory-improvements-design.md) — Memory improvements design (Phases A–D)
+- [`NEXT_STEPS.md`](NEXT_STEPS.md) — Original execution plan (parts now superseded by the merged work)
 
 ## 🔧 Requirements
 
-- Python 3.8+
-- For local LLMs: [Ollama](https://ollama.com) recommended
-- For cloud LLMs: API key from respective provider
+- Python 3.10+ (the code uses PEP 604/585 type syntax)
+- `openai>=1.0.0`, `httpx>=0.24.0`, `sentence-transformers>=2.2.0` (installed via `requirements.txt`)
+- Optional: `docker` (`pip install docker`) for `--docker` / `--docker-persistent`
+- Optional: `anthropic` for the Anthropic backend
+- For local LLMs: [Ollama](https://ollama.com)
 
 ## 📝 License
 
@@ -286,4 +312,4 @@ MIT License
 
 ## 🙏 Acknowledgments
 
-Built with inspiration from autonomous agent research and the self-improvement loop concept.
+Built as a portfolio exploration of self-improvement loops in coding agents.

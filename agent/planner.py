@@ -54,45 +54,54 @@ Guidelines:
     async def create_plan(
         self,
         goal: str,
-        similar_solutions: List[Dict[str, Any]] = None
+        similar_solutions: List[Dict[str, Any]] = None,
+        relevant_learnings: List[Dict[str, Any]] = None,
     ) -> Plan:
         """
         Create a plan for achieving the goal.
-        
+
         Args:
             goal: The coding task to accomplish
-            similar_solutions: Optional list of similar past solutions
-        
+            similar_solutions: Optional list of similar past solutions (patterns)
+            relevant_learnings: Optional list of structured Learnings retrieved
+                from long-term memory (Phase B/C). Surfaced verbatim so the
+                planner can apply concrete, transferable advice.
+
         Returns:
             Plan object with steps and test cases
         """
         # Build prompt with context from similar solutions
         prompt_parts = [f"Goal: {goal}\n"]
-        
+
+        if relevant_learnings:
+            prompt_parts.append("\nRelevant lessons from past successful tasks:")
+            for i, learning in enumerate(relevant_learnings[:5], 1):
+                prompt_parts.append(f"- {learning.get('lesson', '').strip()}")
+
         if similar_solutions:
             prompt_parts.append("\nHere are similar problems that were solved successfully:")
             for i, sol in enumerate(similar_solutions[:2], 1):
                 prompt_parts.append(f"\nExample {i}:")
                 prompt_parts.append(f"Goal: {sol['goal']}")
                 prompt_parts.append(f"Approach: {' -> '.join(sol['plan']['steps'][:3])}")
-        
+
         prompt_parts.append("\nCreate a detailed plan to implement this.")
         prompt = "\n".join(prompt_parts)
-        
+
         # Get LLM response
         response = await self.llm.complete(
             system=self.SYSTEM_PROMPT,
             prompt=prompt,
             temperature=0.7
         )
-        
+
         # Parse JSON response
         try:
             data = json.loads(response)
         except json.JSONDecodeError:
             # Try to extract JSON from markdown
             data = self._extract_json_from_markdown(response)
-        
+
         return Plan(
             goal=goal,
             steps=data.get("steps", []),
@@ -101,7 +110,8 @@ Guidelines:
             dependencies=data.get("dependencies", []),
             context={
                 "estimated_complexity": data.get("estimated_complexity", "medium"),
-                "similar_examples_used": len(similar_solutions) if similar_solutions else 0
+                "similar_examples_used": len(similar_solutions) if similar_solutions else 0,
+                "learnings_surfaced": len(relevant_learnings) if relevant_learnings else 0,
             },
             project_type=data.get("project_type", "general"),
             use_multi_file=data.get("use_multi_file", False),

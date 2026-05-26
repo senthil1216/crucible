@@ -52,5 +52,39 @@ class TestDockerWorkspaceMethods:
         result = mock_executor.create_directory("src")
         assert result is False
 
-    # TODO: Add more tests with mocked exec_run and put_archive
-    # for successful write/read/list/create scenarios.
+    def test_capture_environment_returns_empty_when_not_persistent(self, mock_executor):
+        mock_executor.persistent = False
+        result = mock_executor.capture_environment()
+        assert result == {"installed_packages": [], "workspace_files": []}
+
+    def test_capture_environment_parses_pip_freeze(self, mock_executor):
+        """capture_environment should return pip names (lowercase, no versions)
+        and shallow workspace listing."""
+        pip_output = b"fastapi==0.110.0\nuvicorn==0.29.0\nPydantic==2.6.0\n"
+        ls_output = b"main.py\nrequirements.txt\n"
+
+        def fake_exec_run(cmd, **kwargs):
+            result = MagicMock()
+            joined = " ".join(cmd) if isinstance(cmd, list) else cmd
+            if "pip list" in joined:
+                result.exit_code = 0
+                result.output = (pip_output, b"")
+            elif "ls" in joined:
+                result.exit_code = 0
+                result.output = (ls_output, b"")
+            else:
+                result.exit_code = 0
+                result.output = (b"", b"")
+            return result
+
+        mock_executor._persistent_container.exec_run.side_effect = fake_exec_run
+
+        result = mock_executor.capture_environment()
+        assert "fastapi" in result["installed_packages"]
+        assert "uvicorn" in result["installed_packages"]
+        # Pydantic is lowercased on the way out
+        assert "pydantic" in result["installed_packages"]
+        # No versions
+        assert all("==" not in pkg for pkg in result["installed_packages"])
+        assert "main.py" in result["workspace_files"]
+        assert "requirements.txt" in result["workspace_files"]
