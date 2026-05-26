@@ -28,17 +28,19 @@ class MockLLMClient(LLMClient):
     
     async def complete(self, prompt: str, system: str = None, temperature: float = 0.7) -> str:
         self.call_count += 1
-        
-        # Determine what type of request this is
-        if "Create a plan" in prompt or "plan" in system.lower():
-            return self._plan_response(prompt)
-        
-        if "Generate complete, runnable code" in prompt or "fix" in prompt.lower():
+        system_lower = (system or "").lower()
+
+        # Check code generation BEFORE plan detection because system prompts
+        # for code generation may mention the word "plan" in passing.
+        if "Generate complete, runnable code" in prompt or "Please fix" in prompt:
             return self._code_response(prompt)
-        
-        if "Analyze this test failure" in prompt or "debugging" in system.lower():
+
+        if "Create a detailed plan" in prompt or "coding agent planner" in system_lower:
+            return self._plan_response(prompt)
+
+        if "Analyze this test failure" in prompt or "debugging" in system_lower:
             return self._reflection_response(prompt)
-        
+
         # Default response
         return self.responses.get("default", '{"success": true, "analysis": "OK"}')
     

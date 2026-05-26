@@ -3,7 +3,7 @@ Code Generator: Generates code based on plans.
 """
 
 import re
-from typing import Protocol
+from typing import Optional, Protocol
 
 from agent.models import Plan, CodeArtifact
 

@@ -17,7 +17,8 @@ class TestDockerWorkspaceMethods:
     @pytest.fixture
     def mock_executor(self):
         """Create a DockerExecutor with a mocked persistent container."""
-        with patch("agent.executor.docker_executor.docker") as mock_docker:
+        with patch("agent.executor.docker_executor.DOCKER_AVAILABLE", True), \
+             patch("agent.executor.docker_executor.docker") as mock_docker:
             executor = DockerExecutor(docker_client=MagicMock())
             executor.persistent = True
             executor._persistent_container = MagicMock()

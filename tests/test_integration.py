@@ -8,7 +8,7 @@ import tempfile
 import shutil
 from pathlib import Path
 
-from agent import SelfImprovingAgent, AgentConfig
+from agent import SelfImprovingAgent, AgentConfig, LoopConfig
 from agent.llm_clients import MockLLMClient
 from agent.models import Status
 
@@ -32,7 +32,7 @@ class TestAgentIntegration:
             workspace_path=temp_workspace,
             memory_path=temp_workspace / ".memory",
             state_path=temp_workspace / ".state",
-            loop__max_iterations=3
+            loop=LoopConfig(max_iterations=3)
         )
         return SelfImprovingAgent(llm_client=mock_llm, config=config)
     
@@ -98,7 +98,7 @@ async def test_end_to_end_workflow():
             workspace_path=temp_dir / "workspace",
             memory_path=temp_dir / "memory",
             state_path=temp_dir / "state",
-            loop__max_iterations=2
+            loop=LoopConfig(max_iterations=2)
         )
         
         agent = SelfImprovingAgent(llm_client=llm, config=config)
