@@ -83,8 +83,8 @@ class MockCodeGenerator:
 class MockTester:
     def __init__(self, should_pass=True):
         self.should_pass = should_pass
-    
-    async def run_tests(self, code, plan):
+
+    async def run_tests(self, code, plan, **kwargs):
         return TestResults(
             passed=self.should_pass,
             stdout="hello" if self.should_pass else "",
