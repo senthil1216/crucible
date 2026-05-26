@@ -30,14 +30,18 @@ Your response must be valid JSON in this exact format:
     "test_cases": ["test case 1", "test case 2", ...],
     "language": "python",
     "dependencies": ["package1", "package2"],
-    "estimated_complexity": "low|medium|high"
+    "estimated_complexity": "low|medium|high",
+    "project_type": "general|fastapi|python_package|cli_tool|web_app",
+    "use_multi_file": true|false
 }
 
 Guidelines:
 - Steps should be specific and actionable
 - Test cases should cover main functionality and edge cases
 - Language should be one of: python, javascript
-- Dependencies should be standard pip/npm packages only"""
+- Dependencies should be standard pip/npm packages only
+- Set "use_multi_file" to true if the task would benefit from multiple files (e.g. web apps, libraries, CLI tools with multiple modules).
+- Choose an appropriate "project_type" when use_multi_file is true."""
 
     def __init__(
         self,
@@ -98,7 +102,9 @@ Guidelines:
             context={
                 "estimated_complexity": data.get("estimated_complexity", "medium"),
                 "similar_examples_used": len(similar_solutions) if similar_solutions else 0
-            }
+            },
+            project_type=data.get("project_type", "general"),
+            use_multi_file=data.get("use_multi_file", False),
         )
     
     def _extract_json_from_markdown(self, text: str) -> Dict[str, Any]:

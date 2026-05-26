@@ -23,22 +23,30 @@ class Tester:
     async def run_tests(
         self,
         code: CodeArtifact,
-        plan: Plan
+        plan: Plan,
+        run_from_workspace: bool = False
     ) -> TestResults:
         """
         Run tests on the generated code.
-        
-        Args:
-            code: The code artifact to test
-            plan: The plan containing test cases
-        
-        Returns:
-            TestResults with pass/fail status and details
+
+        When run_from_workspace=True (Phase 2 multi-file mode), the executor
+        should run commands from within the project workspace.
         """
-        # The sandboxed executor runs the code and returns results
-        # The code should include its own tests/assertions
+        if run_from_workspace and hasattr(self.executor, "run_in_workspace"):
+            # For multi-file projects, prefer running via workspace command
+            # The code's file_path tells us the entry point
+            cmd = f"python {code.file_path}"
+            exit_code, stdout, stderr = self.executor.run_in_workspace(cmd)
+
+            return TestResults(
+                passed=exit_code == 0,
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+            )
+
+        # Default path (works for both single-file and legacy)
         results = await self.executor.execute(code)
-        
         return results
     
     async def validate_syntax(
