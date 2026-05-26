@@ -325,6 +325,21 @@ class SelfImprovingAgent:
                 }
             )
             print(f"💾 Stored successful pattern in long-term memory")
+
+            # Phase B: ask the Reflector to extract reusable lessons and persist them.
+            # Best-effort — failures here must not break the success path.
+            try:
+                learnings = await self.reflector.extract_learnings(
+                    plan=state.plan,
+                    code=state.code,
+                    task_id=task_id,
+                )
+                for learning in learnings:
+                    await self.long_term_memory.store_learning(learning)
+                if learnings:
+                    print(f"📘 Stored {len(learnings)} learning(s) from reflection")
+            except Exception as e:
+                print(f"⚠️  Learning extraction failed (non-fatal): {e}")
         
         # Clean up old checkpoints
         await self.state_manager.cleanup_old_checkpoints(task_id, keep_last=3)

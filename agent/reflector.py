@@ -7,7 +7,7 @@ import re
 from typing import Protocol, List, Optional
 
 from agent.models import (
-    TestResults, CodeArtifact, Reflection, ErrorSignature, Plan
+    TestResults, CodeArtifact, Reflection, ErrorSignature, Plan, Learning
 )
 from agent.memory.failure_memory import FailureMemory
 
@@ -43,6 +43,23 @@ Respond in valid JSON format:
 }
 
 Be honest about confidence. If the error seems hopeless or unclear, set should_continue to false."""
+
+    LEARNING_SYSTEM_PROMPT = """You are reviewing a coding task that just succeeded.
+Extract 0–3 short, reusable lessons that would help on similar future tasks.
+
+A good lesson is concrete and transferable. Bad: "the code worked." Good: "For
+FastAPI projects, expose a /health endpoint for liveness probes." Skip the
+boilerplate; do not restate the task description.
+
+Respond in valid JSON:
+{
+  "learnings": [
+    {"lesson": "...", "tags": ["fastapi", "health-check"]},
+    ...
+  ]
+}
+
+If nothing non-obvious was learned, return {"learnings": []}."""
 
     def __init__(
         self,
@@ -255,6 +272,75 @@ Be honest about confidence. If the error seems hopeless or unclear, set should_c
                 "confidence": 0.5
             }
     
+    async def extract_learnings(
+        self,
+        plan: Plan,
+        code: CodeArtifact,
+        task_id: Optional[str] = None,
+    ) -> List[Learning]:
+        """
+        Ask the LLM to extract reusable lessons from a successful task.
+
+        Returns 0-3 Learning entries. Failures during extraction (LLM errors,
+        unparseable response) are swallowed and return an empty list — learnings
+        are best-effort and must not break the success path.
+        """
+        prompt_parts = [
+            "Successful Task",
+            "",
+            "Goal:",
+            plan.goal,
+            "",
+            f"Project type: {getattr(plan, 'project_type', 'general')}",
+            f"Language: {getattr(plan, 'language', 'python')}",
+        ]
+        if plan.dependencies:
+            prompt_parts.extend(["", "Dependencies: " + ", ".join(plan.dependencies)])
+        prompt_parts.extend([
+            "",
+            "Solution Code:",
+            "```",
+            code.source[:2000],
+            "```",
+            "",
+            "Extract reusable lessons.",
+        ])
+        prompt = "\n".join(prompt_parts)
+
+        try:
+            response = await self.llm.complete(
+                system=self.LEARNING_SYSTEM_PROMPT,
+                prompt=prompt,
+                temperature=0.3,
+            )
+        except Exception:
+            return []
+
+        parsed = self._parse_response(response) or {}
+        raw_items = parsed.get("learnings") or []
+        if not isinstance(raw_items, list):
+            return []
+
+        learnings: List[Learning] = []
+        for item in raw_items[:3]:  # cap at 3
+            if not isinstance(item, dict):
+                continue
+            lesson_text = (item.get("lesson") or "").strip()
+            if not lesson_text:
+                continue
+            tags = item.get("tags") or []
+            if not isinstance(tags, list):
+                tags = []
+            learnings.append(Learning(
+                lesson=lesson_text,
+                project_type=getattr(plan, "project_type", "general"),
+                language=getattr(plan, "language", "python"),
+                tags=[str(t) for t in tags],
+                source_task_id=task_id,
+                source_goal=plan.goal,
+            ))
+        return learnings
+
     def _is_hopeless_case(
         self,
         test_results: TestResults,

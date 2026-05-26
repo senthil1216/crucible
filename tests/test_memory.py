@@ -20,6 +20,7 @@ from agent.models import (
     TestResults,
     Reflection,
     ErrorSignature,
+    Learning,
     Status,
 )
 
@@ -362,6 +363,75 @@ class TestFailureMemory:
         results = await memory.find_similar_failures(query_sig)
         assert len(results) >= 1
         assert memory._cache[0].content.get("error_embedding")
+
+
+class TestLearningStorage:
+    """Tests for Phase B: structured Learnings written by the Reflector."""
+
+    @pytest.mark.asyncio
+    async def test_store_and_retrieve_learning(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        learning = Learning(
+            lesson="For FastAPI projects, expose a /health endpoint.",
+            project_type="fastapi",
+            language="python",
+            tags=["fastapi", "health-check"],
+            source_task_id="task_1",
+            source_goal="build a web service",
+        )
+        learning_id = await memory.store_learning(learning)
+        assert learning_id
+
+        results = await memory.find_relevant_learnings(
+            "build a web app with health checks",
+            project_type="fastapi",
+            min_similarity=0.0,
+        )
+        assert len(results) == 1
+        assert "health" in results[0]["lesson"].lower()
+
+    @pytest.mark.asyncio
+    async def test_project_type_general_matches_any(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        general_lesson = Learning(
+            lesson="Always validate input before processing.",
+            project_type="general",
+            language="python",
+        )
+        fastapi_lesson = Learning(
+            lesson="FastAPI dependency injection beats manual wiring.",
+            project_type="fastapi",
+            language="python",
+        )
+        await memory.store_learning(general_lesson)
+        await memory.store_learning(fastapi_lesson)
+
+        # Querying for fastapi should pull both: the fastapi lesson by
+        # project_type, and the general lesson because "general" matches anything.
+        results = await memory.find_relevant_learnings(
+            "validate input in fastapi", project_type="fastapi", min_similarity=0.0
+        )
+        project_types = {r["project_type"] for r in results}
+        assert "general" in project_types
+        assert "fastapi" in project_types
+
+    @pytest.mark.asyncio
+    async def test_learnings_persist_across_instances(self, temp_dir, fake_embeddings):
+        memory1 = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        await memory1.store_learning(Learning(
+            lesson="Prefer csv.DictReader for CSV parsing.",
+            project_type="general",
+            language="python",
+        ))
+
+        # New instance should load the persisted learning.
+        memory2 = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        results = await memory2.find_relevant_learnings(
+            "parse a csv file", min_similarity=0.0
+        )
+        assert len(results) == 1
 
 
 def test_cosine_similarity_basics():

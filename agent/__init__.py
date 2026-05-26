@@ -23,6 +23,7 @@ from agent.models import (
     CodeArtifact,
     TestResults,
     Reflection,
+    Learning,
     IterationState,
     Status
 )
@@ -31,11 +32,12 @@ __version__ = "0.1.0"
 __all__ = [
     "SelfImprovingAgent",
     "AgentConfig",
-    "LoopConfig", 
+    "LoopConfig",
     "Plan",
     "CodeArtifact",
     "TestResults",
     "Reflection",
+    "Learning",
     "IterationState",
     "Status"
 ]
