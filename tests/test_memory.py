@@ -20,6 +20,7 @@ from agent.models import (
     TestResults,
     Reflection,
     ErrorSignature,
+    Learning,
     Status,
 )
 
@@ -182,7 +183,8 @@ class TestLongTermMemory:
         assert results[0]["similarity"] > 0
 
     @pytest.mark.asyncio
-    async def test_filter_by_project_type(self, temp_dir, fake_embeddings):
+    async def test_project_type_boost_ranks_matching_first(self, temp_dir, fake_embeddings):
+        """Soft-signal scoring: matching project_type boosts rank, not exclusion."""
         memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
 
         web_plan = Plan(
@@ -200,20 +202,18 @@ class TestLongTermMemory:
         await memory.store_pattern("build a web app", web_plan, code)
         await memory.store_pattern("build a web app", cli_plan, code)
 
-        only_web = await memory.find_similar_solutions(
+        ranked = await memory.find_similar_solutions(
             "build a web app", k=5, min_similarity=0.0, project_type="fastapi"
         )
-        assert len(only_web) == 1
-        assert only_web[0]["project_type"] == "fastapi"
-
-        only_cli = await memory.find_similar_solutions(
-            "build a web app", k=5, min_similarity=0.0, project_type="cli_tool"
-        )
-        assert len(only_cli) == 1
-        assert only_cli[0]["project_type"] == "cli_tool"
+        # Both come back; fastapi ranks first because of the project_type bonus.
+        assert len(ranked) == 2
+        assert ranked[0]["project_type"] == "fastapi"
+        assert ranked[1]["project_type"] == "cli_tool"
+        assert ranked[0]["similarity"] > ranked[0]["base_similarity"]
+        assert ranked[1]["similarity"] == ranked[1]["base_similarity"]
 
     @pytest.mark.asyncio
-    async def test_filter_by_dependencies(self, temp_dir, fake_embeddings):
+    async def test_dependency_overlap_boost_ranks_matching_first(self, temp_dir, fake_embeddings):
         memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
 
         fastapi_plan = Plan(
@@ -231,14 +231,75 @@ class TestLongTermMemory:
         await memory.store_pattern("serve an endpoint", fastapi_plan, code)
         await memory.store_pattern("serve an endpoint", flask_plan, code)
 
-        results = await memory.find_similar_solutions(
+        ranked = await memory.find_similar_solutions(
             "serve an endpoint",
             k=5,
             min_similarity=0.0,
             dependencies=["fastapi"],
         )
-        assert len(results) == 1
-        assert "fastapi" in results[0]["dependencies"]
+        # Both come back; the fastapi entry ranks first because of overlap.
+        assert len(ranked) == 2
+        assert "fastapi" in ranked[0]["dependencies"]
+        assert "flask" in ranked[1]["dependencies"]
+
+    @pytest.mark.asyncio
+    async def test_env_context_is_stored_and_returned(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        plan = Plan(goal="x", steps=[], test_cases=[], language="python")
+        code = CodeArtifact(source="x", file_path="x.py", language="python")
+        env = {
+            "installed_packages": ["fastapi", "uvicorn", "pydantic"],
+            "workspace_files": ["main.py", "requirements.txt"],
+        }
+        await memory.store_pattern("x", plan, code, environment_context=env)
+
+        results = await memory.find_similar_solutions("x", k=1, min_similarity=0.0)
+        assert results[0]["environment_context"]["installed_packages"] == [
+            "fastapi", "uvicorn", "pydantic"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_installed_package_overlap_boosts_score(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        # Two patterns with identical goals but different env footprints.
+        plan = Plan(goal="g", steps=[], test_cases=[], language="python")
+        code = CodeArtifact(source="x", file_path="x.py", language="python")
+
+        await memory.store_pattern(
+            "g", plan, code,
+            environment_context={"installed_packages": ["fastapi", "uvicorn"]},
+        )
+        await memory.store_pattern(
+            "g", plan, code,
+            environment_context={"installed_packages": ["flask"]},
+        )
+
+        ranked = await memory.find_similar_solutions(
+            "g", k=5, min_similarity=0.0,
+            installed_packages=["fastapi", "uvicorn", "pydantic"],
+        )
+        # The fastapi/uvicorn pattern overlaps with the query env and ranks first.
+        assert "fastapi" in ranked[0]["environment_context"]["installed_packages"]
+        assert ranked[0]["similarity"] > ranked[0]["base_similarity"]
+
+    @pytest.mark.asyncio
+    async def test_strict_filters_restore_exclusion(self, temp_dir, fake_embeddings):
+        """strict_filters=True keeps the old hard-filter behavior."""
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        a = Plan(goal="g", steps=[], test_cases=[], language="python", project_type="fastapi")
+        b = Plan(goal="g", steps=[], test_cases=[], language="python", project_type="cli_tool")
+        code = CodeArtifact(source="x = 1", file_path="x.py", language="python")
+        await memory.store_pattern("g", a, code)
+        await memory.store_pattern("g", b, code)
+
+        only = await memory.find_similar_solutions(
+            "g", k=5, min_similarity=0.0, project_type="fastapi", strict_filters=True
+        )
+        assert len(only) == 1
+        assert only[0]["project_type"] == "fastapi"
 
     @pytest.mark.asyncio
     async def test_legacy_entry_without_embedding(self, temp_dir, fake_embeddings):
@@ -362,6 +423,75 @@ class TestFailureMemory:
         results = await memory.find_similar_failures(query_sig)
         assert len(results) >= 1
         assert memory._cache[0].content.get("error_embedding")
+
+
+class TestLearningStorage:
+    """Tests for Phase B: structured Learnings written by the Reflector."""
+
+    @pytest.mark.asyncio
+    async def test_store_and_retrieve_learning(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        learning = Learning(
+            lesson="For FastAPI projects, expose a /health endpoint.",
+            project_type="fastapi",
+            language="python",
+            tags=["fastapi", "health-check"],
+            source_task_id="task_1",
+            source_goal="build a web service",
+        )
+        learning_id = await memory.store_learning(learning)
+        assert learning_id
+
+        results = await memory.find_relevant_learnings(
+            "build a web app with health checks",
+            project_type="fastapi",
+            min_similarity=0.0,
+        )
+        assert len(results) == 1
+        assert "health" in results[0]["lesson"].lower()
+
+    @pytest.mark.asyncio
+    async def test_project_type_general_matches_any(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        general_lesson = Learning(
+            lesson="Always validate input before processing.",
+            project_type="general",
+            language="python",
+        )
+        fastapi_lesson = Learning(
+            lesson="FastAPI dependency injection beats manual wiring.",
+            project_type="fastapi",
+            language="python",
+        )
+        await memory.store_learning(general_lesson)
+        await memory.store_learning(fastapi_lesson)
+
+        # Querying for fastapi should pull both: the fastapi lesson by
+        # project_type, and the general lesson because "general" matches anything.
+        results = await memory.find_relevant_learnings(
+            "validate input in fastapi", project_type="fastapi", min_similarity=0.0
+        )
+        project_types = {r["project_type"] for r in results}
+        assert "general" in project_types
+        assert "fastapi" in project_types
+
+    @pytest.mark.asyncio
+    async def test_learnings_persist_across_instances(self, temp_dir, fake_embeddings):
+        memory1 = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        await memory1.store_learning(Learning(
+            lesson="Prefer csv.DictReader for CSV parsing.",
+            project_type="general",
+            language="python",
+        ))
+
+        # New instance should load the persisted learning.
+        memory2 = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        results = await memory2.find_relevant_learnings(
+            "parse a csv file", min_similarity=0.0
+        )
+        assert len(results) == 1
 
 
 def test_cosine_similarity_basics():

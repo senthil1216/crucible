@@ -30,6 +30,11 @@ class MockLLMClient(LLMClient):
         self.call_count += 1
         system_lower = (system or "").lower()
 
+        # Learning extraction (Phase B) is detected before code/plan because the
+        # learning prompt mentions both.
+        if "Extract reusable lessons" in prompt or "reusable lessons" in system_lower:
+            return '{"learnings": []}'
+
         # Check code generation BEFORE plan detection because system prompts
         # for code generation may mention the word "plan" in passing.
         if "Generate complete, runnable code" in prompt or "Please fix" in prompt:

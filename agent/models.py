@@ -165,6 +165,49 @@ class Reflection:
 
 
 @dataclass
+class Learning:
+    """
+    A reusable lesson extracted by the Reflector on a successful run.
+
+    Written to long-term memory and surfaced to the Planner on similar future
+    tasks. Examples:
+      "For FastAPI projects, always include a /health endpoint."
+      "When parsing CSVs in Python, prefer csv.DictReader over manual splits."
+    """
+    lesson: str
+    project_type: str = "general"
+    language: str = "python"
+    tags: List[str] = field(default_factory=list)
+    source_task_id: Optional[str] = None
+    source_goal: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "lesson": self.lesson,
+            "project_type": self.project_type,
+            "language": self.language,
+            "tags": self.tags,
+            "source_task_id": self.source_task_id,
+            "source_goal": self.source_goal,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Learning":
+        ts = data.get("timestamp")
+        return cls(
+            lesson=data["lesson"],
+            project_type=data.get("project_type", "general"),
+            language=data.get("language", "python"),
+            tags=data.get("tags", []) or [],
+            source_task_id=data.get("source_task_id"),
+            source_goal=data.get("source_goal"),
+            timestamp=datetime.fromisoformat(ts) if ts else datetime.now(),
+        )
+
+
+@dataclass
 class IterationState:
     """Complete state of one loop iteration - allows resumability."""
     iteration: int
