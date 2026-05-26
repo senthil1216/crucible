@@ -230,7 +230,7 @@ python -m agent "Build a FastAPI app with health + items endpoints" \
   --llm ollama --docker --docker-persistent
 ```
 
-The container exposes `write_file`, `read_file`, `list_dir`, `create_directory`, and `run_command_in_workspace` via `DockerExecutor`. `DependencyManager` watches for `ModuleNotFoundError` and reinstalls missing packages (up to 4 attempts per task) before handing off to the Reflector. Design notes in [`docs/phase1-dependency-recovery-design.md`](docs/phase1-dependency-recovery-design.md) and [`docs/phase2-workspace-design.md`](docs/phase2-workspace-design.md).
+The container exposes `write_file`, `read_file`, `list_dir`, `create_directory`, and `run_command_in_workspace` via `DockerExecutor`. `DependencyManager` watches for `ModuleNotFoundError` and reinstalls missing packages (up to 4 attempts per task) before handing off to the Reflector. Remaining hardening work is tracked in [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md).
 
 ## ⚙️ Configuration
 
@@ -293,10 +293,7 @@ agent = SelfImprovingAgent(
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — Architecture and design decisions
 - [`LOCAL_LLM_GUIDE.md`](LOCAL_LLM_GUIDE.md) — Local LLM setup (Ollama, LM Studio, etc.)
 - [`KIMI_SETUP.md`](KIMI_SETUP.md) — Kimi (Moonshot AI) setup
-- [`docs/phase1-dependency-recovery-design.md`](docs/phase1-dependency-recovery-design.md) — Dependency recovery design
-- [`docs/phase2-workspace-design.md`](docs/phase2-workspace-design.md) — Multi-file workspace design
-- [`docs/long-term-memory-improvements-design.md`](docs/long-term-memory-improvements-design.md) — Memory improvements design (Phases A–D)
-- [`NEXT_STEPS.md`](NEXT_STEPS.md) — Original execution plan (parts now superseded by the merged work)
+- [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md) — Consolidated plan: what's merged, what's open, and the recommended order
 
 ## 🔧 Requirements
 
