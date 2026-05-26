@@ -321,6 +321,16 @@ class SelfImprovingAgent:
         
         # Store successful pattern in long-term memory
         if state.status == Status.SUCCESS:
+            # Phase D: snapshot the executor's environment (installed packages,
+            # workspace files) when available. Best-effort — defaults to {}
+            # for executors that don't expose capture_environment.
+            env_ctx = {}
+            if hasattr(self.sandbox, "capture_environment"):
+                try:
+                    env_ctx = self.sandbox.capture_environment() or {}
+                except Exception as e:
+                    print(f"⚠️  capture_environment failed (non-fatal): {e}")
+
             await self.long_term_memory.store_pattern(
                 goal=goal,
                 plan=state.plan,
@@ -328,7 +338,8 @@ class SelfImprovingAgent:
                 metadata={
                     "iterations": state.iteration,
                     "task_id": task_id
-                }
+                },
+                environment_context=env_ctx,
             )
             print(f"💾 Stored successful pattern in long-term memory")
 

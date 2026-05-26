@@ -243,6 +243,48 @@ class TestLongTermMemory:
         assert "flask" in ranked[1]["dependencies"]
 
     @pytest.mark.asyncio
+    async def test_env_context_is_stored_and_returned(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        plan = Plan(goal="x", steps=[], test_cases=[], language="python")
+        code = CodeArtifact(source="x", file_path="x.py", language="python")
+        env = {
+            "installed_packages": ["fastapi", "uvicorn", "pydantic"],
+            "workspace_files": ["main.py", "requirements.txt"],
+        }
+        await memory.store_pattern("x", plan, code, environment_context=env)
+
+        results = await memory.find_similar_solutions("x", k=1, min_similarity=0.0)
+        assert results[0]["environment_context"]["installed_packages"] == [
+            "fastapi", "uvicorn", "pydantic"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_installed_package_overlap_boosts_score(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        # Two patterns with identical goals but different env footprints.
+        plan = Plan(goal="g", steps=[], test_cases=[], language="python")
+        code = CodeArtifact(source="x", file_path="x.py", language="python")
+
+        await memory.store_pattern(
+            "g", plan, code,
+            environment_context={"installed_packages": ["fastapi", "uvicorn"]},
+        )
+        await memory.store_pattern(
+            "g", plan, code,
+            environment_context={"installed_packages": ["flask"]},
+        )
+
+        ranked = await memory.find_similar_solutions(
+            "g", k=5, min_similarity=0.0,
+            installed_packages=["fastapi", "uvicorn", "pydantic"],
+        )
+        # The fastapi/uvicorn pattern overlaps with the query env and ranks first.
+        assert "fastapi" in ranked[0]["environment_context"]["installed_packages"]
+        assert ranked[0]["similarity"] > ranked[0]["base_similarity"]
+
+    @pytest.mark.asyncio
     async def test_strict_filters_restore_exclusion(self, temp_dir, fake_embeddings):
         """strict_filters=True keeps the old hard-filter behavior."""
         memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)

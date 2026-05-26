@@ -104,8 +104,17 @@ class LongTermMemory:
         plan: Plan,
         code: CodeArtifact,
         metadata: Dict[str, Any] = None,
+        environment_context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Store a successful solution pattern."""
+        """
+        Store a successful solution pattern.
+
+        environment_context (Phase D): optional snapshot of the runtime env
+        that produced this success, e.g.
+            {"installed_packages": [...], "workspace_files": [...]}
+        Captured from the executor when available. Stored verbatim and used
+        as an additional retrieval signal by find_similar_solutions.
+        """
 
         pattern_id = hashlib.sha256(
             f"{goal}:{code.source}".encode()
@@ -119,6 +128,7 @@ class LongTermMemory:
             "project_type": getattr(plan, "project_type", "general"),
             "dependencies": list(getattr(plan, "dependencies", []) or []),
             "language": getattr(plan, "language", "python"),
+            "environment_context": environment_context or {},
         }
 
         entry = MemoryEntry(
@@ -132,11 +142,12 @@ class LongTermMemory:
 
         return pattern_id
 
-    # Phase C: multi-signal scoring weights. Tuned so that semantic similarity
+    # Phase C/D: multi-signal scoring weights. Tuned so that semantic similarity
     # remains the dominant signal, with structured matches as tiebreakers /
     # boosts. Adjust if calibration data warrants.
     _PROJECT_TYPE_BONUS = 0.15
     _DEPENDENCY_BONUS_MAX = 0.10
+    _ENV_PACKAGE_BONUS_MAX = 0.10
 
     async def find_similar_solutions(
         self,
@@ -145,6 +156,7 @@ class LongTermMemory:
         min_similarity: float = 0.3,
         project_type: Optional[str] = None,
         dependencies: Optional[List[str]] = None,
+        installed_packages: Optional[List[str]] = None,
         strict_filters: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -172,11 +184,14 @@ class LongTermMemory:
 
         query_emb = self._embed(goal)
         dep_filter = set(dependencies) if dependencies else None
+        pkg_filter = {p.lower() for p in installed_packages} if installed_packages else None
 
         scored: List[tuple] = []
         for entry in self._cache:
             entry_project_type = entry.content.get("project_type")
             stored_deps = set(entry.content.get("dependencies") or [])
+            env_ctx = entry.content.get("environment_context") or {}
+            stored_pkgs = {p.lower() for p in env_ctx.get("installed_packages") or []}
 
             if strict_filters:
                 if project_type and entry_project_type != project_type:
@@ -199,6 +214,13 @@ class LongTermMemory:
                     self._DEPENDENCY_BONUS_MAX * (overlap / max(len(dep_filter), 1)),
                 )
                 score += bonus
+            if pkg_filter and stored_pkgs:
+                overlap = len(stored_pkgs & pkg_filter)
+                bonus = min(
+                    self._ENV_PACKAGE_BONUS_MAX,
+                    self._ENV_PACKAGE_BONUS_MAX * (overlap / max(len(pkg_filter), 1)),
+                )
+                score += bonus
 
             if score >= min_similarity:
                 scored.append((score, base, entry))
@@ -216,6 +238,7 @@ class LongTermMemory:
                 "code": entry.content["code"],
                 "project_type": entry.content.get("project_type", "general"),
                 "dependencies": entry.content.get("dependencies", []),
+                "environment_context": entry.content.get("environment_context") or {},
                 "metadata": entry.metadata,
             })
 
