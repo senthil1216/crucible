@@ -1,5 +1,11 @@
 """
 Sandboxed execution environment with resource limits.
+
+SECURITY: Ergonomic isolation, not a security boundary.
+ - macOS RLIMIT_AS is a no-op; only Docker mem_limit enforces memory.
+ - AST safety checks are bypassed by aliasing, getattr, and import-aliasing.
+ - Subprocesses inherit filesystem and network capabilities.
+ - For untrusted code, use the Docker executor (see docker/).
 """
 
 import asyncio
@@ -189,45 +195,50 @@ class SandboxedExecutor:
         workspace: Path
     ) -> TestResults:
         """Execute Python code with resource limits."""
-        
+
         start_time = time.time()
-        
-        # Build the command with resource limits
+
         cmd = [
             sys.executable,
             "-c",
             self._build_resource_limited_runner(code_path)
         ]
-        
+
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_seconds
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=self.config.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return TestResults(
+                    passed=False,
+                    stderr=f"Execution timeout after {self.config.timeout_seconds}s",
+                    exit_code=-1,
+                    error_type="TimeoutError",
+                    execution_time=self.config.timeout_seconds
+                )
+
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
             execution_time = time.time() - start_time
-            
-            # Parse results
+
             return TestResults(
-                passed=result.returncode == 0,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
+                passed=proc.returncode == 0,
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=proc.returncode,
                 execution_time=execution_time,
-                error_type=self._classify_error(result.returncode, result.stderr)
+                error_type=self._classify_error(proc.returncode, stderr)
             )
-            
-        except subprocess.TimeoutExpired:
-            return TestResults(
-                passed=False,
-                stderr=f"Execution timeout after {self.config.timeout_seconds}s",
-                exit_code=-1,
-                error_type="TimeoutError",
-                execution_time=self.config.timeout_seconds
-            )
+
         except Exception as e:
             return TestResults(
                 passed=False,
@@ -300,47 +311,25 @@ except Exception as e:
         workspace: Path
     ) -> TestResults:
         """Execute JavaScript code using Node.js."""
-        
+
         start_time = time.time()
-        
-        # Use timeout command for resource limits
+
+        # Use the GNU `timeout` wrapper for resource limits; asyncio.wait_for
+        # is the belt-and-suspenders cap.
         cmd = [
             "timeout",
             f"{self.config.timeout_seconds}s",
             "node",
             str(code_path)
         ]
-        
+
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_seconds + 2  # Slightly longer for timeout cmd
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            
-            execution_time = time.time() - start_time
-            
-            # timeout command returns 124 on timeout
-            if result.returncode == 124:
-                return TestResults(
-                    passed=False,
-                    stderr=f"Execution timeout after {self.config.timeout_seconds}s",
-                    exit_code=-1,
-                    error_type="TimeoutError",
-                    execution_time=self.config.timeout_seconds
-                )
-            
-            return TestResults(
-                passed=result.returncode == 0,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
-                execution_time=execution_time,
-                error_type=self._classify_js_error(result.returncode, result.stderr)
-            )
-            
         except FileNotFoundError:
             return TestResults(
                 passed=False,
@@ -348,13 +337,43 @@ except Exception as e:
                 exit_code=-1,
                 error_type="RuntimeNotFound"
             )
-        except subprocess.TimeoutExpired:
+
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=self.config.timeout_seconds + 2
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
             return TestResults(
                 passed=False,
                 stderr="Execution timeout",
                 exit_code=-1,
                 error_type="TimeoutError"
             )
+
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        execution_time = time.time() - start_time
+
+        # GNU timeout returns 124 when it killed the child.
+        if proc.returncode == 124:
+            return TestResults(
+                passed=False,
+                stderr=f"Execution timeout after {self.config.timeout_seconds}s",
+                exit_code=-1,
+                error_type="TimeoutError",
+                execution_time=self.config.timeout_seconds
+            )
+
+        return TestResults(
+            passed=proc.returncode == 0,
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=proc.returncode,
+            execution_time=execution_time,
+            error_type=self._classify_js_error(proc.returncode, stderr)
+        )
     
     def _classify_error(self, exit_code: int, stderr: str) -> Optional[str]:
         """Classify Python error from exit code and stderr."""

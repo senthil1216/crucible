@@ -98,19 +98,31 @@ class Tester:
                     error_type="SyntaxError"
                 )
         elif code.language == "javascript":
-            # Use node --check for syntax validation
-            import subprocess
+            # Use node --check for syntax validation.
+            import asyncio
             try:
-                result = subprocess.run(
-                    ["node", "--check", "-e", code.source],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
+                proc = await asyncio.create_subprocess_exec(
+                    "node", "--check", "-e", code.source,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
+                try:
+                    _stdout_b, stderr_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=5
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return TestResults(
+                        passed=False,
+                        stderr="node --check timeout",
+                        error_type="TimeoutError",
+                    )
+                stderr = stderr_b.decode("utf-8", errors="replace")
                 return TestResults(
-                    passed=result.returncode == 0,
-                    stderr=result.stderr,
-                    error_type="SyntaxError" if result.returncode != 0 else None
+                    passed=proc.returncode == 0,
+                    stderr=stderr,
+                    error_type="SyntaxError" if proc.returncode != 0 else None
                 )
             except Exception as e:
                 return TestResults(

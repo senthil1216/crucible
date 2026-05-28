@@ -332,6 +332,51 @@ class TestLongTermMemory:
         assert memory._cache[0].content.get("goal_embedding")
 
 
+class TestErrorSignatureNormalize:
+    """The normalize() output is used as a grouping key; it must collapse
+    runtime-varying values (addresses, paths) while preserving signal
+    (type names, identifiers, small line numbers)."""
+
+    def test_preserves_identifier_names(self):
+        # Two NameErrors on different identifiers must produce different keys —
+        # otherwise we lose the very signal we want to learn from.
+        a = ErrorSignature(error_type="NameError", error_message="name 'foo' is not defined")
+        b = ErrorSignature(error_type="NameError", error_message="name 'bar' is not defined")
+        assert a.normalize() != b.normalize()
+
+    def test_collapses_memory_addresses(self):
+        # Same error with different object addresses should match.
+        a = ErrorSignature(
+            error_type="AttributeError",
+            error_message="'NoneType' object has no attribute 'foo' at 0x7fabc123"
+        )
+        b = ErrorSignature(
+            error_type="AttributeError",
+            error_message="'NoneType' object has no attribute 'foo' at 0x7fdef456"
+        )
+        assert a.normalize() == b.normalize()
+        assert "{addr}" in a.normalize()
+
+    def test_collapses_absolute_paths(self):
+        # Same FileNotFoundError on different tmp paths should match.
+        a = ErrorSignature(
+            error_type="FileNotFoundError",
+            error_message="No such file: /tmp/abc123/data.csv"
+        )
+        b = ErrorSignature(
+            error_type="FileNotFoundError",
+            error_message="No such file: /tmp/xyz789/data.csv"
+        )
+        assert a.normalize() == b.normalize()
+        assert "{path}" in a.normalize()
+
+    def test_preserves_small_line_numbers(self):
+        # "line 5" vs "line 47" should NOT collapse — line numbers are signal.
+        a = ErrorSignature(error_type="SyntaxError", error_message="invalid syntax at line 5")
+        b = ErrorSignature(error_type="SyntaxError", error_message="invalid syntax at line 47")
+        assert a.normalize() != b.normalize()
+
+
 class TestFailureMemory:
     """Tests for failure memory with semantic retrieval."""
 

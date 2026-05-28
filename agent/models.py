@@ -141,15 +141,29 @@ class ErrorSignature:
     file_path: Optional[str] = None
     
     def normalize(self) -> str:
-        """Create a normalized string for similarity comparison."""
-        # Remove specific variable names, line numbers, etc.
-        msg = self.error_message.lower()
-        # Normalize quotes
-        msg = msg.replace("'", '"')
-        # Normalize specific values
+        """Create a normalized string for similarity comparison.
+
+        Strips only runtime-varying values (memory addresses, file paths,
+        object reprs, large numerals) so that the remaining signal — type
+        names, attribute names, identifiers — survives. The result is used
+        as a grouping key in FailureMemory; collapsing all lowercase
+        identifiers to {var} would erase the very thing we want to match on.
+        """
         import re
-        msg = re.sub(r'\b\d+\b', '{num}', msg)
-        msg = re.sub(r'\b[a-z_][a-z0-9_]*\b', '{var}', msg)
+
+        msg = self.error_message
+        # Normalize quotes so "x" and 'x' group together.
+        msg = msg.replace("'", '"')
+        # Memory addresses: 0x7fabc123 -> {addr}.
+        msg = re.sub(r"0x[0-9a-fA-F]+", "{addr}", msg)
+        # POSIX absolute paths and Windows drive paths -> {path}.
+        msg = re.sub(r"/[^\s'\"<>]+", "{path}", msg)
+        msg = re.sub(r"[A-Za-z]:\\[^\s'\"<>]+", "{path}", msg)
+        # Object reprs after address normalization: <pkg.Class object at {addr}>.
+        msg = re.sub(r"<[\w.]+ object at \{addr\}>", "{obj}", msg)
+        # Collapse runs of >=5 digits (timestamps, large IDs) but keep small
+        # numbers (line numbers, indices) so "line 12" vs "line 47" still differ.
+        msg = re.sub(r"\b\d{5,}\b", "{n}", msg)
         return f"{self.error_type}:{msg}"
     
     def to_dict(self) -> Dict[str, Any]:
@@ -172,7 +186,11 @@ class Reflection:
     suggested_fix: Optional[str] = None
     should_continue: bool = True
     confidence: float = 0.5
-    
+    # ID of the FailureMemory entry written for this iteration's failure (if
+    # any). The loop reads this on the next iteration's success to mark the
+    # prior failure was_fixed=True.
+    failure_id: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
@@ -182,7 +200,8 @@ class Reflection:
             "hypothesis": self.hypothesis,
             "suggested_fix": self.suggested_fix,
             "should_continue": self.should_continue,
-            "confidence": self.confidence
+            "confidence": self.confidence,
+            "failure_id": self.failure_id,
         }
 
 

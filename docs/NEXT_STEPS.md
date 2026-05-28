@@ -33,50 +33,15 @@ Merged work (no further action needed):
   attempts. (PR #2/#3)
 - **README rewrite** — honest framing, accurate project structure,
   documented Docker/multi-file modes. (PR #6)
+- **Track A — v0.1.0 cleanup** — `ErrorSignature.normalize` tightened to
+  preserve identifier signal; `was_fixed` wired end-to-end via
+  `Reflection.failure_id` + `FailureMemory.mark_fixed` (broken→fixed diff
+  stored, +0.05 retrieval boost); async subprocess in `_execute_python`,
+  `_execute_javascript`, and `validate_syntax`; dead `_is_hopeless_case`
+  removed; SECURITY notes added to `sandbox.py` and `safety/checker.py`;
+  `CHANGELOG.md` introduced. (PR TBD — v0.1.0)
 
 ## What's open
-
-### Track A — Tidy and ship v0.1.0
-
-Small leftovers from the original `NEXT_STEPS.md` Phase 1 list that have
-not been fixed. Mostly mechanical, low-risk, but should land together
-before we tag.
-
-- **Wire `was_fixed` correctly** (`agent/memory/failure_memory.py:66,85`,
-  `agent/loop.py`). When iteration N+1 succeeds and N failed, mark N's
-  failure entry `was_fixed=True` and store the broken→fixed diff. Boost
-  `find_similar_failures` for fix-confirmed entries. The "learn from past
-  mistakes" thesis isn't actually wired up today.
-- **Fix the double-plan call** (`agent/core.py:247` vs
-  `agent/loop.py:269`). `core.solve()` calls `planner.create_plan` and
-  discards the result; then the loop runs its own planning inside the
-  first iteration. Drop the call at `core.py:247` and let the loop own
-  planning (or pass the pre-plan through and stop the loop from re-planning).
-- **Delete dead `_is_hopeless_case`** (`agent/reflector.py:344`). Defined,
-  never called. Either wire it into the loop or remove it.
-- **Replace blocking `subprocess.run`** (`agent/executor/sandbox.py:94`
-  and `:206`). Both sit inside `async def` methods and block the event
-  loop. Switch to `asyncio.create_subprocess_exec`.
-- **Fix `ErrorSignature.normalize`** (`agent/models.py:121-131`). The
-  regex `\b[a-z_][a-z0-9_]*\b` collapses every lowercase identifier into
-  `{var}`, destroying signal. We sidestepped this in `FailureMemory` by
-  embedding the *raw* error message, but the normalize method is still
-  used for `error_key` grouping and is still bad. Tighten the regex to
-  strip only runtime-varying values (memory addresses, specific paths,
-  instance reprs); keep type names, line numbers, and identifiers.
-- **Add a SECURITY NOTE inside `agent/executor/sandbox.py`** at file top.
-  The README is honest about this; the file isn't. One paragraph:
-  "Ergonomic isolation, not a security boundary. macOS `RLIMIT_AS` is a
-  no-op, AST aliasing bypasses safety checks, subprocess inherits
-  filesystem and network capabilities." Mirrors the README.
-- **Acknowledge safety-theater in `agent/safety/checker.py`**. The
-  `_is_safe_filesystem_call` method at line 153 unconditionally returns
-  `False`; the AST walker only inspects direct `ast.Call` nodes, missing
-  aliasing (`o = open; o(...)`), import-aliasing
-  (`import subprocess as s`), and `getattr` access. Either tighten or
-  add an inline note that this is best-effort static analysis.
-
-When the above is done: `pytest` green, brief `CHANGELOG.md`, tag `v0.1.0`.
 
 ### Track B — DependencyManager hardening
 
@@ -163,12 +128,10 @@ Sketched weekends:
 
 ## Recommended order
 
-1. **Track A** in one PR (or 2 small PRs grouped by file area). Stops the
-   bleeding on known bugs; gets us to a tag.
+1. ~~**Track A**~~ — done. Tag `v0.1.0` after the PR merges.
 2. **Track C** next (small, validates the memory work).
 3. **Track B** opportunistically — pick off tasks as the demo exposes
    gaps. Don't block Track D on a complete `DependencyManager`.
 4. **Track D** — the long pole. Plan for ~4 weekends part-time.
 
-Total: roughly 5–6 weeks part-time → one publishable artifact and a
-shippable `v0.1.0` along the way.
+Total: roughly 4–5 weeks part-time remaining → one publishable artifact.
