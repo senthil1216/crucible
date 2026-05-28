@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import time
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, List
 from datetime import datetime
 
 from agent.profiling import StepProfiler
@@ -267,6 +267,17 @@ class SelfImprovingAgent:
             if relevant_learnings:
                 print(f"📘 Surfaced {len(relevant_learnings)} relevant learning(s)")
 
+            # Record retrieval so each surfaced Learning's times_retrieved
+            # ticks up exactly once per task. The matching times_helpful
+            # bump happens in _post_execution if this task succeeds.
+            retrieved_learning_ids = [
+                l["id"] for l in relevant_learnings if l.get("id")
+            ]
+            if retrieved_learning_ids:
+                self.long_term_memory.record_learnings_retrieved(
+                    retrieved_learning_ids
+                )
+
             # Plan once, here, using retrieved memories, and hand it to the loop
             # so it doesn't plan again. (Resuming reuses the checkpoint's plan, so
             # skip planning entirely in that case.)
@@ -284,10 +295,13 @@ class SelfImprovingAgent:
                 resume_from=resume_from,
                 plan=plan,
             )
-            
+
             # Post-execution processing
-            await self._post_execution(final_state, task_id, goal)
-            
+            await self._post_execution(
+                final_state, task_id, goal,
+                retrieved_learning_ids=retrieved_learning_ids,
+            )
+
             return final_state
             
         finally:
@@ -323,7 +337,8 @@ class SelfImprovingAgent:
         self,
         state: IterationState,
         task_id: str,
-        goal: str
+        goal: str,
+        retrieved_learning_ids: Optional[List[str]] = None,
     ) -> None:
         """Handle post-execution tasks."""
         # Persist the final generated code to a temp directory inside the repo.
@@ -395,6 +410,17 @@ class SelfImprovingAgent:
                     print(f"📘 Stored {len(learnings)} learning(s) from reflection")
             except Exception as e:
                 print(f"⚠️  Learning extraction failed (non-fatal): {e}")
+
+            # Learning feedback loop: mark the Learnings that were in scope
+            # at plan time as helpful — they were present during a task that
+            # subsequently succeeded. Correlation, not causation, but the
+            # right noisy prior to nudge future retrieval ranking.
+            if retrieved_learning_ids:
+                updated = self.long_term_memory.record_learnings_helpful(
+                    retrieved_learning_ids
+                )
+                if updated:
+                    print(f"📈 Bumped helpfulness on {updated} learning(s)")
         
         # Clean up old checkpoints
         await self.state_manager.cleanup_old_checkpoints(task_id, keep_last=3)

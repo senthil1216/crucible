@@ -214,6 +214,13 @@ class Learning:
     tasks. Examples:
       "For FastAPI projects, always include a /health endpoint."
       "When parsing CSVs in Python, prefer csv.DictReader over manual splits."
+
+    Usefulness tracking: `times_retrieved` and `times_helpful` are updated by
+    the loop as the Learning gets surfaced on subsequent tasks. A Laplace-
+    smoothed helpfulness rate is folded into retrieval scoring so proven
+    lessons outrank speculative ones over time. Note this is a correlation
+    signal (retrieved + task succeeded), not causation — the LLM may have
+    ignored the lesson. Good enough as a noisy prior.
     """
     lesson: str
     project_type: str = "general"
@@ -222,6 +229,13 @@ class Learning:
     source_task_id: Optional[str] = None
     source_goal: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
+    times_retrieved: int = 0
+    times_helpful: int = 0
+
+    def helpfulness_rate(self) -> float:
+        """Laplace-smoothed ratio. Defaults to 0.5 with no data — neither
+        promotes nor demotes a brand-new Learning."""
+        return (self.times_helpful + 1) / (self.times_retrieved + 2)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -232,6 +246,8 @@ class Learning:
             "source_task_id": self.source_task_id,
             "source_goal": self.source_goal,
             "timestamp": self.timestamp.isoformat(),
+            "times_retrieved": self.times_retrieved,
+            "times_helpful": self.times_helpful,
         }
 
     @classmethod
@@ -245,6 +261,8 @@ class Learning:
             source_task_id=data.get("source_task_id"),
             source_goal=data.get("source_goal"),
             timestamp=datetime.fromisoformat(ts) if ts else datetime.now(),
+            times_retrieved=int(data.get("times_retrieved", 0) or 0),
+            times_helpful=int(data.get("times_helpful", 0) or 0),
         )
 
 
