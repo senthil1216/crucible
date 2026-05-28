@@ -539,6 +539,125 @@ class TestLearningStorage:
         assert len(results) == 1
 
 
+class TestLearningUsefulness:
+    """Phase: Learning feedback loop. The agent treats Learnings that have
+    been present-on-success more often as more valuable, via a Laplace-
+    smoothed helpfulness rate folded into retrieval scoring."""
+
+    @pytest.mark.asyncio
+    async def test_record_retrieved_increments_counter(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        learning_id = await memory.store_learning(Learning(
+            lesson="Prefer csv.DictReader for CSV parsing.",
+            project_type="general",
+        ))
+
+        updated = memory.record_learnings_retrieved([learning_id])
+        assert updated == 1
+        entry = memory._learnings_cache[0]
+        assert entry.content["times_retrieved"] == 1
+
+        # Second call further increments.
+        memory.record_learnings_retrieved([learning_id])
+        assert memory._learnings_cache[0].content["times_retrieved"] == 2
+
+    @pytest.mark.asyncio
+    async def test_record_helpful_increments_counter(self, temp_dir, fake_embeddings):
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        learning_id = await memory.store_learning(Learning(
+            lesson="Use pathlib for file paths.",
+            project_type="general",
+        ))
+
+        memory.record_learnings_helpful([learning_id])
+        assert memory._learnings_cache[0].content["times_helpful"] == 1
+
+    @pytest.mark.asyncio
+    async def test_counters_persist_across_instances(self, temp_dir, fake_embeddings):
+        # Counters are part of the on-disk Learning representation. A new
+        # LongTermMemory instance reloading from disk should see them.
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        learning_id = await memory.store_learning(Learning(
+            lesson="Avoid mutable default arguments.",
+            project_type="general",
+        ))
+        memory.record_learnings_retrieved([learning_id])
+        memory.record_learnings_helpful([learning_id])
+
+        memory2 = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        assert memory2._learnings_cache[0].content["times_retrieved"] == 1
+        assert memory2._learnings_cache[0].content["times_helpful"] == 1
+
+    @pytest.mark.asyncio
+    async def test_helpful_learning_ranks_above_unhelpful(self, temp_dir, fake_embeddings):
+        # Two Learnings of comparable semantic similarity, but one has a
+        # strong helpfulness track record. Retrieval should rank the
+        # helpful one first.
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        unproven = await memory.store_learning(Learning(
+            lesson="Parse a csv file row by row.",
+            project_type="general",
+        ))
+        proven = await memory.store_learning(Learning(
+            lesson="Parse a csv file with DictReader.",
+            project_type="general",
+        ))
+
+        # Stack the deck: `proven` was retrieved 10 times and helped 9.
+        # `unproven` has no history.
+        for _ in range(10):
+            memory.record_learnings_retrieved([proven])
+        for _ in range(9):
+            memory.record_learnings_helpful([proven])
+
+        results = await memory.find_relevant_learnings(
+            "parse a csv file", min_similarity=0.0
+        )
+        assert len(results) == 2
+        # Proven should sort first because helpfulness bonus pushes it up.
+        assert results[0]["id"] == proven
+        assert results[0]["usefulness_bonus"] > 0
+        assert results[1]["id"] == unproven
+        # Brand-new entry sits at rate=0.5 → bonus exactly 0.
+        assert results[1]["usefulness_bonus"] == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_legacy_entries_without_counters_load_ok(self, temp_dir, fake_embeddings):
+        # Existing learnings.jsonl entries written before counters existed
+        # must still load and not blow up retrieval.
+        import json as _json
+        from datetime import datetime as _dt
+
+        legacy = {
+            "id": "legacy_learning_1",
+            "content": {
+                "lesson": "An old, counter-less lesson about logging.",
+                "project_type": "general",
+                "language": "python",
+                "tags": [],
+                "source_task_id": "old_task",
+                "source_goal": "log things",
+                "timestamp": _dt.now().isoformat(),
+                # Intentionally NO times_retrieved / times_helpful keys.
+            },
+            "timestamp": _dt.now().isoformat(),
+            "metadata": {},
+        }
+        with open(temp_dir / "learnings.jsonl", "w") as f:
+            f.write(_json.dumps(legacy) + "\n")
+
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+        results = await memory.find_relevant_learnings(
+            "log some things", min_similarity=0.0
+        )
+        assert len(results) == 1
+        # Defaults should be 0 (treated as never-retrieved / never-helpful).
+        assert results[0]["times_retrieved"] == 0
+        assert results[0]["times_helpful"] == 0
+        # Brand-new → neutral bonus.
+        assert results[0]["usefulness_bonus"] == pytest.approx(0.0)
+
+
 def test_cosine_similarity_basics():
     assert cosine_similarity([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
     assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)

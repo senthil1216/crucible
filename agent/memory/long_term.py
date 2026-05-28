@@ -82,6 +82,54 @@ class LongTermMemory:
         with open(self.learnings_file, 'a') as f:
             f.write(json.dumps(entry.to_dict()) + '\n')
 
+    def _rewrite_learnings_to_disk(self) -> None:
+        """Rewrite learnings.jsonl from the in-memory cache. Used for
+        in-place updates to existing entries (usefulness counters). The
+        cache is the source of truth; mirrors FailureMemory._rewrite_*."""
+        tmp = self.learnings_file.with_suffix(".jsonl.tmp")
+        with open(tmp, 'w') as f:
+            for entry in self._learnings_cache:
+                f.write(json.dumps(entry.to_dict()) + '\n')
+        tmp.replace(self.learnings_file)
+
+    def record_learnings_retrieved(self, learning_ids: List[str]) -> int:
+        """Bump times_retrieved on the named entries. Called by the loop
+        when Learnings are surfaced to the Planner. Returns the number of
+        entries actually updated."""
+        if not learning_ids:
+            return 0
+        wanted = set(learning_ids)
+        updated = 0
+        for entry in self._learnings_cache:
+            if entry.id in wanted:
+                entry.content["times_retrieved"] = int(
+                    entry.content.get("times_retrieved", 0) or 0
+                ) + 1
+                updated += 1
+        if updated:
+            self._rewrite_learnings_to_disk()
+        return updated
+
+    def record_learnings_helpful(self, learning_ids: List[str]) -> int:
+        """Bump times_helpful on the named entries. Called by the loop on
+        task success for the Learnings that were in scope at plan time.
+        Note: correlation, not causation — the LLM may have ignored the
+        lesson. We accept the noise; the Laplace prior in helpfulness_rate
+        prevents one-off boosts from dominating."""
+        if not learning_ids:
+            return 0
+        wanted = set(learning_ids)
+        updated = 0
+        for entry in self._learnings_cache:
+            if entry.id in wanted:
+                entry.content["times_helpful"] = int(
+                    entry.content.get("times_helpful", 0) or 0
+                ) + 1
+                updated += 1
+        if updated:
+            self._rewrite_learnings_to_disk()
+        return updated
+
     def _embed(self, text: str) -> List[float]:
         return self._embeddings.encode(text)
 
@@ -260,6 +308,13 @@ class LongTermMemory:
         self._save_learning_entry(entry)
         return learning_id
 
+    # Max bonus added to a learning's similarity score based on its
+    # historical helpfulness rate. Tuned to be the same order as the
+    # project-type bonus used by find_similar_solutions (0.15) but
+    # smaller — usefulness is a noisy correlation signal and shouldn't
+    # dominate semantic match.
+    _USEFULNESS_BONUS_MAX = 0.10
+
     async def find_relevant_learnings(
         self,
         goal: str,
@@ -270,7 +325,16 @@ class LongTermMemory:
     ) -> List[Dict[str, Any]]:
         """
         Retrieve lessons relevant to a new task by semantic similarity, with
-        optional structural filters.
+        optional structural filters and a historical-helpfulness bonus.
+
+        Final score = cosine(goal, lesson) + helpfulness_bonus.
+        Helpfulness bonus = (Laplace-smoothed rate − 0.5) × 2 × MAX, capped
+        in [−MAX, +MAX]. Brand-new entries (no retrievals yet) sit at
+        rate=0.5 and get a zero adjustment — neither promoted nor demoted.
+
+        Threshold (`min_similarity`) is applied to the *raw* cosine, not
+        the boosted score; we don't let a well-performing Learning sneak
+        past a semantic mismatch.
         """
         if not self._learnings_cache:
             return []
@@ -289,20 +353,31 @@ class LongTermMemory:
                 emb = self._embed(entry.content.get("lesson", ""))
                 entry.content["lesson_embedding"] = emb
             similarity = cosine_similarity(query_emb, emb)
-            if similarity >= min_similarity:
-                scored.append((similarity, entry))
+            if similarity < min_similarity:
+                continue
+
+            times_retrieved = int(entry.content.get("times_retrieved", 0) or 0)
+            times_helpful = int(entry.content.get("times_helpful", 0) or 0)
+            rate = (times_helpful + 1) / (times_retrieved + 2)
+            bonus = (rate - 0.5) * 2 * self._USEFULNESS_BONUS_MAX
+            score = similarity + bonus
+            scored.append((score, similarity, bonus, entry))
 
         scored.sort(reverse=True, key=lambda x: x[0])
         results: List[Dict[str, Any]] = []
-        for score, entry in scored[:k]:
+        for score, similarity, bonus, entry in scored[:k]:
             results.append({
                 "id": entry.id,
-                "similarity": score,
+                "similarity": similarity,
+                "score": score,
+                "usefulness_bonus": bonus,
                 "lesson": entry.content["lesson"],
                 "project_type": entry.content.get("project_type", "general"),
                 "language": entry.content.get("language", "python"),
                 "tags": entry.content.get("tags", []),
                 "source_task_id": entry.content.get("source_task_id"),
+                "times_retrieved": int(entry.content.get("times_retrieved", 0) or 0),
+                "times_helpful": int(entry.content.get("times_helpful", 0) or 0),
             })
         return results
 
