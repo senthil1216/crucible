@@ -14,7 +14,7 @@ from agent.profiling import StepProfiler
 from agent.models import (
     AgentConfig, IterationState, Status, Plan, CodeArtifact
 )
-from agent.memory import ShortTermMemory, LongTermMemory, FailureMemory
+from agent.memory import ShortTermMemory, LongTermMemory, FailureMemory, PredictionMemory
 from agent.planner import Planner
 from agent.code_generator import CodeGenerator
 from agent.test_generator import TestGenerator
@@ -72,6 +72,13 @@ class SelfImprovingAgent:
         self.short_term_memory = ShortTermMemory(max_history=5)
         self.long_term_memory = LongTermMemory(self.config.memory_path / "patterns")
         self.failure_memory = FailureMemory(self.config.memory_path / "failures")
+        # Track D phase 1: prediction storage. Can be disabled via config
+        # for cost-sensitive backends (every failure → +1 LLM call).
+        self.prediction_memory: Optional[PredictionMemory] = None
+        if getattr(self.config, "predictions_enabled", True):
+            self.prediction_memory = PredictionMemory(
+                self.config.memory_path / "predictions"
+            )
         
         # Initialize components
         self.safety_checker = SafetyChecker(project_dir=self.config.workspace_path)
@@ -106,7 +113,11 @@ class SelfImprovingAgent:
         self.code_generator = CodeGenerator(self.llm)
         self.test_generator = TestGenerator(self.llm)
         self.tester = Tester(executor=self.sandbox)
-        self.reflector = Reflector(self.llm, failure_memory=self.failure_memory)
+        self.reflector = Reflector(
+            self.llm,
+            failure_memory=self.failure_memory,
+            prediction_memory=self.prediction_memory,
+        )
 
         # State persistence
         self.state_manager = StateManager(self.config.state_path)

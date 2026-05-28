@@ -7,9 +7,10 @@ import re
 from typing import Protocol, List, Optional
 
 from agent.models import (
-    TestResults, CodeArtifact, Reflection, ErrorSignature, Plan, Learning
+    TestResults, CodeArtifact, Reflection, ErrorSignature, Plan, Learning, Prediction
 )
 from agent.memory.failure_memory import FailureMemory
+from agent.memory.predictions import PredictionMemory
 
 
 class LLMClient(Protocol):
@@ -65,13 +66,45 @@ Respond in valid JSON:
 
 If nothing non-obvious was learned, return {"learnings": []}."""
 
+    PREDICTION_SYSTEM_PROMPT = """You are inspecting a coding task that just FAILED.
+Your job is to emit 0–3 falsifiable predictions: concrete inputs that would
+exercise the same kind of bug, paired with the error type you expect.
+
+A good prediction is testable. Bad: "edge cases will fail." Good:
+  trigger_input: "[]"
+  predicted_error_type: "IndexError"
+  predicted_explanation: "Empty list dereferenced without bounds check."
+
+Requirements:
+- trigger_input MUST be a concrete value as a Python repr-style string
+  (e.g. "-1", "''", "[]", "{'k': None}"). NEVER vague ("any negative number").
+- predicted_error_type MUST be a Python exception class name
+  (ValueError, TypeError, IndexError, KeyError, AttributeError, ...).
+- Skip predictions you are not confident about; better to emit none.
+
+Respond in valid JSON only:
+{
+  "predictions": [
+    {
+      "trigger_input": "...",
+      "predicted_error_type": "...",
+      "predicted_explanation": "...",
+      "confidence": 0.7
+    }
+  ]
+}
+
+If no useful prediction can be made, return {"predictions": []}."""
+
     def __init__(
         self,
         llm: LLMClient,
-        failure_memory: Optional[FailureMemory] = None
+        failure_memory: Optional[FailureMemory] = None,
+        prediction_memory: Optional[PredictionMemory] = None,
     ):
         self.llm = llm
         self.failure_memory = failure_memory
+        self.prediction_memory = prediction_memory
     
     async def analyze(
         self,
@@ -155,6 +188,32 @@ If nothing non-obvious was learned, return {"learnings": []}."""
                 fix=reflection.suggested_fix or "No fix suggested",
                 goal=plan.goal
             )
+
+        # Track D phase 1: emit falsifiable predictions about *why* this
+        # failed. Best-effort and isolated — if the LLM gives us nothing
+        # useful, or the call itself errors, the reflection still returns
+        # normally. A second LLM call is intentional: keeping prediction
+        # extraction out of the main reflection prompt avoids regressing
+        # reflection quality with extra format pressure.
+        if (
+            not test_results.passed
+            and self.prediction_memory is not None
+            and reflection.failure_id
+        ):
+            try:
+                predictions = await self.extract_predictions(
+                    code=code,
+                    plan=plan,
+                    error_signature=error_sig,
+                    source_failure_id=reflection.failure_id,
+                    task_id=None,
+                )
+                for pred in predictions:
+                    await self.prediction_memory.store(pred)
+            except Exception as e:
+                # Predictions are an experimental signal; never let them
+                # break the reflection path.
+                print(f"⚠️  Prediction extraction failed (non-fatal): {e}")
 
         return reflection
     
@@ -375,4 +434,85 @@ If nothing non-obvious was learned, return {"learnings": []}."""
                 source_goal=plan.goal,
             ))
         return learnings
+
+    async def extract_predictions(
+        self,
+        code: CodeArtifact,
+        plan: Plan,
+        error_signature: ErrorSignature,
+        source_failure_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> List[Prediction]:
+        """
+        Ask the LLM to emit falsifiable predictions about *why* this failure
+        happened — concrete inputs that should trigger the same kind of bug
+        if the code is left unfixed.
+
+        Returns 0-3 Predictions, schema-gated: each must have a concrete
+        trigger_input and a Python exception type. Predictions are the seed
+        of the Track D self-improvement loop — phase 2's replay engine will
+        test them and write back times_tested / times_confirmed.
+
+        Best-effort. Failures (LLM error, unparseable response) return [].
+        """
+        prompt_parts = [
+            "Failed Task",
+            "",
+            "Goal:",
+            plan.goal,
+            "",
+            f"Project type: {getattr(plan, 'project_type', 'general')}",
+            f"Language: {getattr(plan, 'language', 'python')}",
+            "",
+            "Error:",
+            f"  type: {error_signature.error_type}",
+            f"  message: {error_signature.error_message[:300]}",
+            "",
+            "Failing Code:",
+            "```",
+            code.source[:2000],
+            "```",
+            "",
+            (
+                "Emit predictions: for each candidate, give a CONCRETE "
+                "input (Python repr style) and the exception type you "
+                "expect when that input is fed to this code. If you have "
+                "no high-confidence prediction, return an empty list."
+            ),
+        ]
+        prompt = "\n".join(prompt_parts)
+
+        try:
+            response = await self.llm.complete(
+                system=self.PREDICTION_SYSTEM_PROMPT,
+                prompt=prompt,
+                temperature=0.3,
+            )
+        except Exception:
+            return []
+
+        parsed = self._parse_response(response) or {}
+        raw_items = parsed.get("predictions") or []
+        if not isinstance(raw_items, list):
+            return []
+
+        predictions: List[Prediction] = []
+        for item in raw_items[:3]:  # cap at 3
+            if not isinstance(item, dict):
+                continue
+            pred = Prediction(
+                trigger_input=str(item.get("trigger_input") or "").strip(),
+                predicted_error_type=str(item.get("predicted_error_type") or "").strip(),
+                predicted_explanation=str(item.get("predicted_explanation") or "").strip(),
+                confidence=float(item.get("confidence", 0.5) or 0.5),
+                source_failure_id=source_failure_id,
+                source_task_id=task_id,
+                source_goal=plan.goal,
+                language=getattr(plan, "language", "python"),
+            )
+            # Strict schema gate — falsifiability requires a concrete input
+            # and a predicted error type. Drop anything else.
+            if pred.is_well_formed():
+                predictions.append(pred)
+        return predictions
 
