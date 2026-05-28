@@ -267,6 +267,84 @@ class Learning:
 
 
 @dataclass
+class Prediction:
+    """
+    A falsifiable hypothesis about a code failure.
+
+    Emitted by the Reflector after an iteration fails: the agent is asked
+    to produce a *concrete* input that should trigger the same (or a
+    related) failure, plus the error type it expects. A later replay
+    engine (Track D phase 2) will run each prediction against new
+    candidate code and score Confirmed / Falsified.
+
+    `trigger_input` is required — predictions without a concrete input are
+    not falsifiable and are dropped at the schema gate. `confidence` is
+    self-reported by the LLM and should be treated as noisy until the
+    replay engine produces real calibration data.
+
+    `times_tested` and `times_confirmed` are zero in phase 1 (we just
+    store predictions) and incremented by the phase-2 replay engine.
+    """
+    trigger_input: str
+    predicted_error_type: str
+    predicted_explanation: str = ""
+    confidence: float = 0.5
+    source_failure_id: Optional[str] = None
+    source_task_id: Optional[str] = None
+    source_goal: Optional[str] = None
+    language: str = "python"
+    timestamp: datetime = field(default_factory=datetime.now)
+    times_tested: int = 0
+    times_confirmed: int = 0
+
+    def is_well_formed(self) -> bool:
+        """Schema gate. Falsifiability requires a concrete trigger input
+        and a predicted error type; anything else is hand-waving."""
+        return bool(
+            isinstance(self.trigger_input, str)
+            and self.trigger_input.strip()
+            and isinstance(self.predicted_error_type, str)
+            and self.predicted_error_type.strip()
+        )
+
+    def confirmation_rate(self) -> float:
+        """Laplace-smoothed rate. Defaults to 0.5 with no replay history."""
+        return (self.times_confirmed + 1) / (self.times_tested + 2)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "trigger_input": self.trigger_input,
+            "predicted_error_type": self.predicted_error_type,
+            "predicted_explanation": self.predicted_explanation,
+            "confidence": self.confidence,
+            "source_failure_id": self.source_failure_id,
+            "source_task_id": self.source_task_id,
+            "source_goal": self.source_goal,
+            "language": self.language,
+            "timestamp": self.timestamp.isoformat(),
+            "times_tested": self.times_tested,
+            "times_confirmed": self.times_confirmed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Prediction":
+        ts = data.get("timestamp")
+        return cls(
+            trigger_input=data["trigger_input"],
+            predicted_error_type=data.get("predicted_error_type", ""),
+            predicted_explanation=data.get("predicted_explanation", ""),
+            confidence=float(data.get("confidence", 0.5) or 0.5),
+            source_failure_id=data.get("source_failure_id"),
+            source_task_id=data.get("source_task_id"),
+            source_goal=data.get("source_goal"),
+            language=data.get("language", "python"),
+            timestamp=datetime.fromisoformat(ts) if ts else datetime.now(),
+            times_tested=int(data.get("times_tested", 0) or 0),
+            times_confirmed=int(data.get("times_confirmed", 0) or 0),
+        )
+
+
+@dataclass
 class IterationState:
     """Complete state of one loop iteration - allows resumability."""
     iteration: int
@@ -387,6 +465,11 @@ class AgentConfig:
     # running, reachable from the host. Requires docker_persistent.
     run_app: bool = False
     app_port: int = 8000
+
+    # Track D phase 1: emit falsifiable predictions about failures. Adds one
+    # extra LLM call per failed iteration; flip off if running against a
+    # paid LLM and cost matters.
+    predictions_enabled: bool = True
     
     # LLM settings
     llm_model: str = "gpt-4"
