@@ -35,6 +35,11 @@ class MockLLMClient(LLMClient):
         if "Extract reusable lessons" in prompt or "reusable lessons" in system_lower:
             return '{"learnings": []}'
 
+        # Test generation (test-first gate) must be detected before code/plan
+        # because the test prompt also mentions the task and its test cases.
+        if "Write a pytest test suite" in prompt or "test author" in system_lower:
+            return self._test_response(prompt)
+
         # Check code generation BEFORE plan detection because system prompts
         # for code generation may mention the word "plan" in passing.
         if "Generate complete, runnable code" in prompt or "Please fix" in prompt:
@@ -100,6 +105,47 @@ class MockLLMClient(LLMClient):
             "estimated_complexity": "medium"
         }'''
     
+    def _test_response(self, prompt: str) -> str:
+        """Generate a pytest suite consistent with the mock implementations."""
+        if "add" in prompt.lower():
+            return '''from solution import add
+
+
+def test_add_basic():
+    assert add(2, 3) == 5
+
+
+def test_add_negative():
+    assert add(-1, 1) == 0
+
+
+def test_add_zero():
+    assert add(0, 0) == 0
+'''
+
+        if "sort" in prompt.lower():
+            return '''from solution import sort_list
+
+
+def test_sort_basic():
+    assert sort_list([3, 1, 2]) == [1, 2, 3]
+
+
+def test_sort_empty():
+    assert sort_list([]) == []
+
+
+def test_sort_single():
+    assert sort_list([1]) == [1]
+'''
+
+        return '''from solution import solution
+
+
+def test_solution_is_callable():
+    assert callable(solution)
+'''
+
     def _code_response(self, prompt: str) -> str:
         """Generate code response."""
         if "add" in prompt.lower():
@@ -417,6 +463,67 @@ class DeepSeekClient(LLMClient):
             
         except Exception as e:
             raise RuntimeError(f"DeepSeek API error: {e}")
+
+
+class XAIClient(LLMClient):
+    """
+    xAI (Grok) API client.
+    xAI has an OpenAI-compatible API.
+
+    Requires: pip install openai
+
+    Get an API key from: https://console.x.ai/
+    Set XAI_API_KEY, or pass api_key directly.
+
+    Model is overridable (xAI's model ids change over time and vary by account).
+    List what your key can use with:
+        curl https://api.x.ai/v1/models -H "Authorization: Bearer $XAI_API_KEY"
+    Good choices for coding: grok-4.3 (flagship) or grok-build-0.1 (coding-tuned).
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "grok-4.3",
+        max_tokens: int = 2000,
+        base_url: str = "https://api.x.ai/v1",
+    ):
+        try:
+            import openai
+        except ImportError:
+            raise ImportError("xAI client requires: pip install openai")
+
+        self.api_key = api_key or os.getenv("XAI_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "xAI API key required. Set XAI_API_KEY environment variable "
+                "or pass api_key. Get a key from https://console.x.ai/"
+            )
+
+        self.client = openai.AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=base_url,
+        )
+        self.model = model
+        self.max_tokens = max_tokens
+
+    async def complete(self, prompt: str, system: str = None, temperature: float = 0.7) -> str:
+        """Generate completion using the xAI (Grok) API."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=self.max_tokens,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"xAI API error: {e}")
 
 
 class OllamaClient(LLMClient):

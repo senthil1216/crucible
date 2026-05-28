@@ -2,6 +2,7 @@
 Sandboxed execution environment with resource limits.
 """
 
+import asyncio
 import subprocess
 import tempfile
 import sys
@@ -16,6 +17,38 @@ import time
 
 from agent.models import CodeArtifact, TestResults, AgentConfig
 from agent.safety.checker import SafetyChecker
+from agent.pytest_report import build_test_results
+
+
+def _apply_rlimits(cpu_seconds: int) -> None:
+    """preexec_fn for subprocesses: best-effort CPU/core limits (POSIX).
+
+    Ergonomic isolation, not a security boundary. We deliberately do NOT cap
+    RLIMIT_AS here: it counts virtual address space, and a tight cap kills the
+    pytest runner itself (especially with native deps on Linux). Runaway memory
+    is bounded instead by the wall-clock timeout (and by Docker mem_limit in the
+    container path).
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+    except (ValueError, OSError):
+        pass
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
+
+
+def _is_test_path(rel_path: str) -> bool:
+    """True for files that are part of the test suite (not implementation)."""
+    name = Path(rel_path).name
+    parts = Path(rel_path).parts
+    return (
+        "tests" in parts
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name == "conftest.py"
+    )
 
 
 @dataclass
@@ -74,6 +107,82 @@ class SandboxedExecutor:
                     error_type="UnsupportedLanguage"
                 )
     
+    async def run_pytest(self, files: Dict[str, str]) -> TestResults:
+        """
+        Write `files` to a fresh temp workspace and run a real pytest suite.
+
+        `files` maps relative paths (e.g. "solution.py",
+        "tests/test_solution.py") to their contents. Returns a TestResults
+        built from the pytest JSON report — `passed` is true only if pytest
+        collected at least one test and none failed.
+        """
+        impl_blob = "\n\n".join(
+            src for path, src in files.items() if not _is_test_path(path)
+        )
+        safety_report = self.safety_checker.analyze(
+            CodeArtifact(source=impl_blob, file_path="solution.py", language="python")
+        )
+        if safety_report.level.value == "dangerous":
+            return TestResults(
+                passed=False,
+                stderr=f"Safety violation: {safety_report.warnings}",
+                exit_code=-2,
+                error_type="SafetyError",
+            )
+
+        return await asyncio.to_thread(self._run_pytest_sync, files)
+
+    def _run_pytest_sync(self, files: Dict[str, str]) -> TestResults:
+        start_time = time.time()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            for rel_path, content in files.items():
+                target = workspace / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+
+            report_path = workspace / ".report.json"
+            cmd = [
+                sys.executable, "-m", "pytest", ".",
+                "-p", "no:cacheprovider",
+                "--json-report", f"--json-report-file={report_path}",
+                "-q",
+            ]
+
+            preexec = None
+            if os.name == "posix":
+                cpu = self.config.cpu_time_limit_seconds
+                preexec = lambda: _apply_rlimits(cpu)  # noqa: E731
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=workspace,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.timeout_seconds,
+                    preexec_fn=preexec,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+            except subprocess.TimeoutExpired:
+                return TestResults(
+                    passed=False,
+                    stderr=f"pytest timeout after {self.config.timeout_seconds}s",
+                    exit_code=-1,
+                    error_type="TimeoutError",
+                    execution_time=self.config.timeout_seconds,
+                    from_pytest=True,
+                )
+
+            report_text = report_path.read_text() if report_path.exists() else None
+            return build_test_results(
+                report_text,
+                result.stdout,
+                result.stderr,
+                result.returncode,
+                execution_time=time.time() - start_time,
+            )
+
     async def _execute_python(
         self,
         code_path: Path,

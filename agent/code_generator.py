@@ -6,6 +6,7 @@ import re
 from typing import Optional, Protocol
 
 from agent.models import Plan, CodeArtifact
+from agent.test_generator import MODULE_NAME
 
 
 class LLMClient(Protocol):
@@ -43,17 +44,21 @@ Respond with ONLY the code, no explanations or markdown formatting outside the c
         plan: Plan,
         previous_attempt: str = None,
         error_feedback: str = None,
-        similar_solutions: list = None
+        similar_solutions: list = None,
+        test_code: str = None,
     ) -> CodeArtifact:
         """
         Generate code based on a plan.
-        
+
         Args:
             plan: The execution plan
             previous_attempt: Previous code attempt (if iterating)
             error_feedback: Error message from previous attempt
             similar_solutions: Similar working solutions for reference
-        
+            test_code: The frozen pytest suite the code must satisfy. When
+                provided, it is the authoritative spec — the implementation must
+                make these tests pass and live in module `solution`.
+
         Returns:
             CodeArtifact with generated code
         """
@@ -68,7 +73,18 @@ Respond with ONLY the code, no explanations or markdown formatting outside the c
             "",
             f"Language: {plan.language}",
         ]
-        
+
+        if test_code:
+            prompt_parts += [
+                "",
+                f"Your code MUST live in a module named `{MODULE_NAME}` "
+                f"(file `{MODULE_NAME}.py`) and make this pytest suite pass "
+                "exactly as written. Do not modify or restate the tests:",
+                "```python",
+                test_code,
+                "```",
+            ]
+
         if plan.dependencies:
             prompt_parts.extend([
                 "",
@@ -143,10 +159,13 @@ Respond with ONLY the code, no explanations or markdown formatting outside the c
             "rust": ".rs"
         }
         ext = extensions.get(plan.language, ".txt")
-        
+        # Single-file Python tasks follow the `solution` module contract so the
+        # frozen pytest suite can import them; other languages keep `main`.
+        stem = MODULE_NAME if plan.language == "python" else "main"
+
         return CodeArtifact(
             source=source,
-            file_path=f"main{ext}",
+            file_path=f"{stem}{ext}",
             language=plan.language,
             metadata={
                 "is_fix_attempt": previous_attempt is not None,
@@ -442,21 +461,32 @@ my-cli --name Alice
         broken_code: str,
         error_type: str,
         error_message: str,
-        reflection: str
+        reflection: str,
+        test_code: str = None,
     ) -> CodeArtifact:
         """
         Generate a fix for broken code based on reflection.
-        
+
         Args:
             plan: Original plan
             broken_code: The code that failed
             error_type: Type of error (e.g., "SyntaxError")
             error_message: Error message
             reflection: Analysis of what went wrong
-        
+            test_code: The frozen pytest suite the fix must satisfy. The tests
+                are immutable — only the implementation may change.
+
         Returns:
             Fixed CodeArtifact
         """
+        test_spec = ""
+        if test_code:
+            test_spec = (
+                f"\nThe implementation lives in module `{MODULE_NAME}` and must make "
+                "this pytest suite pass. The tests are frozen — do NOT change them, "
+                "fix the implementation:\n```python\n" + test_code + "\n```\n"
+            )
+
         prompt = f"""Fix the following code based on the error analysis.
 
 Original Task: {plan.goal}
@@ -474,24 +504,25 @@ Error Message: {error_message}
 
 Analysis of what went wrong:
 {reflection}
-
-Please generate the corrected code. Address the root cause identified in the analysis.
+{test_spec}
+Please fix the implementation. Address the root cause identified in the analysis.
 """
-        
+
         response = await self.llm.complete(
             system=self.SYSTEM_PROMPT,
             prompt=prompt,
             temperature=0.6
         )
-        
+
         source = self._extract_code(response)
-        
+
         extensions = {"python": ".py", "javascript": ".js"}
         ext = extensions.get(plan.language, ".txt")
-        
+        stem = MODULE_NAME if plan.language == "python" else "main"
+
         return CodeArtifact(
             source=source,
-            file_path=f"main{ext}",
+            file_path=f"{stem}{ext}",
             language=plan.language,
             metadata={
                 "is_fix_attempt": True,

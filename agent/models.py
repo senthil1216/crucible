@@ -87,7 +87,14 @@ class CodeArtifact:
 
 @dataclass
 class TestResults:
-    """Output of Tester - represents test execution results."""
+    """Output of Tester - represents test execution results.
+
+    When the run came from a real pytest invocation, the `tests_*` counts and
+    `test_failures` carry per-test detail. `tests_collected == 0` means the
+    suite was empty (or failed to collect) and must never be treated as a pass.
+    `failed_tests` keeps the legacy list of failing test node ids for callers
+    that only need names.
+    """
     passed: bool
     stdout: str = ""
     stderr: str = ""
@@ -96,7 +103,16 @@ class TestResults:
     error_type: Optional[str] = None
     failed_tests: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-    
+
+    # Real-pytest detail (Phase: real-pytest success gate)
+    tests_collected: int = 0
+    tests_passed: int = 0
+    tests_failed: int = 0
+    tests_errors: int = 0
+    # Each entry: {"nodeid": str, "outcome": str, "message": str}
+    test_failures: List[Dict[str, Any]] = field(default_factory=list)
+    from_pytest: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "passed": self.passed,
@@ -106,7 +122,13 @@ class TestResults:
             "execution_time": self.execution_time,
             "error_type": self.error_type,
             "failed_tests": self.failed_tests,
-            "warnings": self.warnings
+            "warnings": self.warnings,
+            "tests_collected": self.tests_collected,
+            "tests_passed": self.tests_passed,
+            "tests_failed": self.tests_failed,
+            "tests_errors": self.tests_errors,
+            "test_failures": self.test_failures,
+            "from_pytest": self.from_pytest,
         }
 
 
@@ -218,7 +240,10 @@ class IterationState:
     status: Status
     timestamp: datetime = field(default_factory=datetime.now)
     task_id: Optional[str] = None
-    
+    # Frozen pytest suite for this task. Generated once (test-first) and reused
+    # unchanged across fix iterations so the agent fixes code, never the tests.
+    test_code: Optional[CodeArtifact] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "iteration": self.iteration,
@@ -228,11 +253,13 @@ class IterationState:
             "reflection": self.reflection.to_dict(),
             "status": self.status.value,
             "timestamp": self.timestamp.isoformat(),
-            "task_id": self.task_id
+            "task_id": self.task_id,
+            "test_code": self.test_code.to_dict() if self.test_code else None,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "IterationState":
+        test_code_data = data.get("test_code")
         return cls(
             iteration=data["iteration"],
             plan=Plan.from_dict(data["plan"]),
@@ -241,7 +268,8 @@ class IterationState:
             reflection=Reflection(**data["reflection"]),
             status=Status(data["status"]),
             timestamp=datetime.fromisoformat(data["timestamp"]),
-            task_id=data.get("task_id")
+            task_id=data.get("task_id"),
+            test_code=CodeArtifact(**test_code_data) if test_code_data else None,
         )
 
 
@@ -283,6 +311,11 @@ class LoopConfig:
     stop_on_success: bool = True
     enable_reflection: bool = True
     checkpoint_interval: int = 1  # Save state every N iterations
+
+    # Real-pytest gate: how many times to regenerate a rejected test suite
+    # (structurally invalid, or vacuous against a stub) before giving up /
+    # proceeding with a warning.
+    max_test_regenerations: int = 2
     
     # Circuit breaker settings
     failure_threshold: int = 3
@@ -312,6 +345,11 @@ class AgentConfig:
     docker_persistent: bool = False          # One container per task instead of ephemeral
     docker_enable_network: bool = True       # Needed for pip install etc. in persistent mode
     docker_install_build_tools: bool = True  # Install build-essential etc. on persistent start
+
+    # Run-the-app: after a server task passes its tests, launch it and leave it
+    # running, reachable from the host. Requires docker_persistent.
+    run_app: bool = False
+    app_port: int = 8000
     
     # LLM settings
     llm_model: str = "gpt-4"

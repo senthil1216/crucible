@@ -4,9 +4,12 @@ Core Agent: Main orchestrator for the self-improving coding agent.
 
 import asyncio
 import hashlib
+import time
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 from datetime import datetime
+
+from agent.profiling import StepProfiler
 
 from agent.models import (
     AgentConfig, IterationState, Status, Plan, CodeArtifact
@@ -14,6 +17,7 @@ from agent.models import (
 from agent.memory import ShortTermMemory, LongTermMemory, FailureMemory
 from agent.planner import Planner
 from agent.code_generator import CodeGenerator
+from agent.test_generator import TestGenerator
 from agent.tester import Tester
 from agent.reflector import Reflector
 from agent.executor.sandbox import SandboxedExecutor, ExecutionConfig
@@ -52,6 +56,14 @@ class SelfImprovingAgent:
         self.llm = llm_client
         self.config = config or AgentConfig()
         self.callbacks = callbacks or {}
+
+        # When --run launches a server, keep the container alive past task end so
+        # the app stays reachable; teardown is then the user's call.
+        self._keep_container_alive = False
+
+        # Per-step wall-clock profiling, shared with the execution loop.
+        self.profiler = StepProfiler()
+        self._solve_start: Optional[float] = None
         
         # Initialize workspace
         self.config.workspace_path.mkdir(parents=True, exist_ok=True)
@@ -92,6 +104,7 @@ class SelfImprovingAgent:
         
         self.planner = Planner(self.llm, memory=self.long_term_memory)
         self.code_generator = CodeGenerator(self.llm)
+        self.test_generator = TestGenerator(self.llm)
         self.tester = Tester(executor=self.sandbox)
         self.reflector = Reflector(self.llm, failure_memory=self.failure_memory)
 
@@ -113,6 +126,8 @@ class SelfImprovingAgent:
             on_reflect=self.callbacks.get('on_reflect'),
             install_packages=self.ensure_packages,           # legacy fallback
             dependency_manager=self.dependency_manager,      # Phase 2 preferred path
+            test_generator=self.test_generator,              # real-pytest gate
+            profiler=self.profiler,                          # per-step timing
         )
 
     def ensure_packages(self, packages: list[str]) -> bool:
@@ -218,13 +233,22 @@ class SelfImprovingAgent:
         print(f"🚀 Starting task: {goal}")
         print(f"📋 Task ID: {task_id}")
 
+        # Fresh profiling for this task.
+        self.profiler.reset()
+        self._solve_start = time.perf_counter()
+
         # Reset dependency recovery state for new task
         if self.dependency_manager:
             self.dependency_manager.reset_attempt_count()
 
-        # Phase 2: Start persistent container with task-specific workspace
+        # Phase 2: Start persistent container with task-specific workspace.
+        # Publish the app port up front when --run is requested (port mapping
+        # must be set at container creation time). This includes the one-time
+        # apt/pip setup, which is often a large chunk of the total time.
         if getattr(self.config, "docker_persistent", False) and hasattr(self.sandbox, "start_persistent"):
-            self.sandbox.start_persistent(workspace_id=task_id)
+            publish_port = self.config.app_port if getattr(self.config, "run_app", False) else None
+            with self.profiler.track("container_setup"):
+                self.sandbox.start_persistent(workspace_id=task_id, publish_port=publish_port)
         
         try:
             # Check for existing state if resuming
@@ -243,16 +267,22 @@ class SelfImprovingAgent:
             if relevant_learnings:
                 print(f"📘 Surfaced {len(relevant_learnings)} relevant learning(s)")
 
-            # Pre-planning with retrieved memories
-            plan = await self.planner.create_plan(
-                goal, similar_solutions, relevant_learnings=relevant_learnings
-            )
-            
-            # Run the execution loop
+            # Plan once, here, using retrieved memories, and hand it to the loop
+            # so it doesn't plan again. (Resuming reuses the checkpoint's plan, so
+            # skip planning entirely in that case.)
+            plan = None
+            if resume_from is None:
+                with self.profiler.track("planning"):
+                    plan = await self.planner.create_plan(
+                        goal, similar_solutions, relevant_learnings=relevant_learnings
+                    )
+
+            # Run the execution loop (reusing the memory-informed plan)
             final_state = await self.loop.run(
                 goal=goal,
                 task_id=task_id,
-                resume_from=resume_from
+                resume_from=resume_from,
+                plan=plan,
             )
             
             # Post-execution processing
@@ -266,7 +296,10 @@ class SelfImprovingAgent:
 
     async def _post_execution_cleanup(self, task_id: str) -> None:
         """Central place for all end-of-task cleanup (especially Docker)."""
-        # Phase 2: Stop persistent container
+        # Phase 2: Stop persistent container — unless we deliberately left an app
+        # running inside it (--run).
+        if self._keep_container_alive:
+            return
         if getattr(self.config, "docker_persistent", False) and hasattr(self.sandbox, "stop_persistent"):
             try:
                 self.sandbox.stop_persistent()
@@ -277,6 +310,8 @@ class SelfImprovingAgent:
 
     def __del__(self):
         """Safety net for cleanup if normal paths are bypassed."""
+        if getattr(self, "_keep_container_alive", False):
+            return
         if getattr(self.config, "docker_persistent", False) and hasattr(self, "sandbox"):
             try:
                 if hasattr(self.sandbox, "stop_persistent"):
@@ -305,6 +340,9 @@ class SelfImprovingAgent:
                     "saved_path": str(saved_path),
                     "output_directory": str(output_dir),
                 }
+                # Write the frozen pytest suite next to it so the run is reproducible.
+                if state.test_code and state.test_code.source:
+                    state.test_code.write_to_disk(output_dir)
             except Exception as e:
                 print(f"⚠️  Warning: Failed to write generated code to tmp/: {e}")
         
@@ -361,16 +399,111 @@ class SelfImprovingAgent:
         # Clean up old checkpoints
         await self.state_manager.cleanup_old_checkpoints(task_id, keep_last=3)
 
-        # Phase 2: Stop persistent Docker container when task ends
-        if getattr(self.config, "docker_persistent", False) and hasattr(self.sandbox, "stop_persistent"):
+        # --run: launch the app and leave it running (sets _keep_container_alive).
+        if state.status == Status.SUCCESS:
+            await self._maybe_launch_app(state)
+
+        # Phase 2: Stop persistent Docker container when task ends — unless we
+        # left an app running inside it.
+        if (
+            not self._keep_container_alive
+            and getattr(self.config, "docker_persistent", False)
+            and hasattr(self.sandbox, "stop_persistent")
+        ):
             try:
                 self.sandbox.stop_persistent()
             except Exception:
                 pass
-        
+
         # Print summary
         self._print_summary(state)
     
+    async def _maybe_launch_app(self, state: IterationState) -> None:
+        """
+        Launch a server app after it passes its tests and leave it running.
+
+        Only acts when --run is set, we're in docker-persistent mode, and the
+        generated code looks like a FastAPI app. Best-effort: anything that goes
+        wrong here is reported but never changes the (already successful) result.
+        """
+        if not getattr(self.config, "run_app", False):
+            return
+        if not getattr(self.config, "docker_persistent", False):
+            return
+        if not hasattr(self.sandbox, "launch_app"):
+            return
+
+        source = state.code.source or ""
+        project_type = getattr(state.plan, "project_type", "general")
+        is_fastapi = project_type in ("fastapi", "web_app") or "FastAPI(" in source
+        if not is_fastapi:
+            print(
+                f"\nℹ️  --run: nothing long-running to launch for project type "
+                f"'{project_type}'. Skipping."
+            )
+            return
+
+        port = self.config.app_port
+        app_var = self._detect_fastapi_app_var(source)
+        module = "solution"  # single-file contract used by the pytest gate
+        cmd = f"python -m uvicorn {module}:{app_var} --host 0.0.0.0 --port {port}"
+
+        print(f"\n🚀 Launching app: {cmd}")
+        with self.profiler.track("app_launch"):
+            try:
+                # uvicorn is frequently missing from the plan's declared deps.
+                if self.dependency_manager:
+                    self.dependency_manager.install_packages(["uvicorn"])
+                self.sandbox.launch_app(cmd)
+            except Exception as e:
+                print(f"⚠️  Failed to launch app: {e}")
+                return
+
+            url = f"http://localhost:{port}"
+            healthy = await self._wait_for_http(f"{url}/", timeout=15.0)
+        self._keep_container_alive = True  # leave it running per --run
+
+        if healthy:
+            print(f"✅ App is live at {url}")
+        else:
+            print(
+                f"⚠️  App launched but did not answer on {url} within 15s "
+                "(it may still be starting, or failed to bind)."
+            )
+        cid = (
+            self.sandbox.get_container_short_id()
+            if hasattr(self.sandbox, "get_container_short_id") else None
+        )
+        if cid:
+            print(f"   Container left running — stop it with:  docker stop {cid}")
+
+    @staticmethod
+    def _detect_fastapi_app_var(source: str) -> str:
+        """Find the `<var> = FastAPI(...)` instance name; default 'app'."""
+        import re
+        m = re.search(r"(\w+)\s*=\s*FastAPI\s*\(", source)
+        return m.group(1) if m else "app"
+
+    async def _wait_for_http(self, url: str, timeout: float = 15.0) -> bool:
+        """Poll an HTTP URL from the host until it answers (< 500) or times out."""
+        import urllib.request
+
+        def _probe() -> int:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                return getattr(r, "status", 200)
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            try:
+                status = await asyncio.to_thread(_probe)
+                if status and status < 500:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
     def _print_summary(self, state: IterationState) -> None:
         """Print execution summary."""
         print("\n" + "="*60)
@@ -415,6 +548,12 @@ class SelfImprovingAgent:
         print(f"\n📊 Memory Stats:")
         print(f"   Patterns learned: {lt_stats['total_patterns']}")
         print(f"   Failures recorded: {fail_stats['total_failures']}")
+
+        # Per-step wall-clock profile (which step dominated)
+        total_wc = (time.perf_counter() - self._solve_start) if self._solve_start else None
+        profile = self.profiler.summary(total_wall_clock=total_wc)
+        if profile:
+            print(profile)
     
     def _generate_task_id(self, goal: str) -> str:
         """Generate a unique task ID from the goal."""

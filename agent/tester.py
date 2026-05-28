@@ -2,7 +2,7 @@
 Tester: Runs tests and validates code.
 """
 
-from typing import List
+from typing import Dict, List
 from agent.models import Plan, CodeArtifact, TestResults
 from agent.executor.sandbox import SandboxedExecutor, ExecutionConfig
 
@@ -11,7 +11,9 @@ class Tester:
     """
     Runs tests on generated code using the sandboxed executor.
     """
-    
+
+    __test__ = False  # not a pytest test class
+
     def __init__(self, executor: SandboxedExecutor = None):
         self.executor = executor or SandboxedExecutor(
             config=ExecutionConfig(
@@ -19,6 +21,28 @@ class Tester:
                 memory_limit_mb=512
             )
         )
+
+    async def run_pytest(
+        self,
+        impl_files: Dict[str, str],
+        test_files: Dict[str, str],
+    ) -> TestResults:
+        """
+        Run a real pytest suite over the implementation + frozen test files.
+
+        Delegates to the executor's `run_pytest`, which writes everything to an
+        isolated workspace and returns a TestResults whose `passed` is true only
+        when pytest collected >= 1 test and none failed. The implementation and
+        test files are merged before running.
+        """
+        files = {**impl_files, **test_files}
+        if not hasattr(self.executor, "run_pytest"):
+            return TestResults(
+                passed=False,
+                stderr="Executor does not support pytest-based testing.",
+                error_type="ExecutorError",
+            )
+        return await self.executor.run_pytest(files)
     
     async def run_tests(
         self,

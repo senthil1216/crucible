@@ -1,7 +1,4 @@
-# Core dependencies
-# No strict dependencies - agent works with standard library
-
-# Required for Ollama client
+# Core dependencies (required for basic agent operation + Ollama + semantic memory)
 openai>=1.0.0
 httpx>=0.24.0
 
@@ -23,3 +20,7 @@ sentence-transformers>=2.2.0
 # Development dependencies
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
+
+# Required: the agent gates success on a real pytest run and parses its
+# machine-readable JSON report (used by agent/pytest_report.py).
+pytest-json-report>=1.5.0

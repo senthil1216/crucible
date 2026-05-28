@@ -3,6 +3,7 @@ Execution Loop: Plan → Execute → Test → Reflect cycle.
 Includes circuit breaker pattern and state persistence.
 """
 
+import asyncio
 import time
 from typing import List, Optional, Callable
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ from agent.code_generator import CodeGenerator
 from agent.tester import Tester
 from agent.reflector import Reflector
 from agent.dependency_manager import DependencyManager  # Phase 2
+from agent.test_generator import (
+    TestGenerator, static_check_test_code, build_stub_files, MODULE_NAME,
+)
+from agent.profiling import StepProfiler
 
 
 @dataclass
@@ -105,6 +110,8 @@ class ExecutionLoop:
         on_reflect: Callable[[Reflection], None] = None,
         install_packages: Optional[Callable[[list[str]], bool]] = None,  # Phase 2 (legacy)
         dependency_manager: Optional[DependencyManager] = None,          # Phase 2
+        test_generator: Optional[TestGenerator] = None,                  # real-pytest gate
+        profiler: Optional[StepProfiler] = None,                         # per-step timing
     ):
         self.planner = planner
         self.code_generator = code_generator
@@ -114,6 +121,11 @@ class ExecutionLoop:
         self.config = config or LoopConfig()
         self.install_packages = install_packages
         self.dependency_manager = dependency_manager  # Preferred Phase 2 path
+        # When set, single-file Python tasks are gated on a real, frozen pytest
+        # suite instead of "the script exited 0". When None, the legacy
+        # exit-code behavior is preserved (used by the loop's own unit tests).
+        self.test_generator = test_generator
+        self.profiler = profiler or StepProfiler()
         
         # Circuit breaker
         self.circuit_breaker = CircuitBreaker(
@@ -133,7 +145,8 @@ class ExecutionLoop:
         self,
         goal: str,
         task_id: Optional[str] = None,
-        resume_from: Optional[IterationState] = None
+        resume_from: Optional[IterationState] = None,
+        plan: Optional[Plan] = None,
     ) -> IterationState:
         """
         Run the execution loop until success, failure, or max iterations.
@@ -142,21 +155,64 @@ class ExecutionLoop:
             goal: The coding task to accomplish
             task_id: Optional identifier for this task
             resume_from: Optional state to resume from
-        
+            plan: Optional pre-computed plan. When the caller already planned
+                (e.g. core, using long-term memory), pass it here so the loop
+                reuses it instead of making a second, memory-blind plan call.
+
         Returns:
             Final iteration state
         """
         # Initialize or restore state
         if resume_from:
             current_plan = resume_from.plan
+            frozen_tests = resume_from.test_code
             iteration = resume_from.iteration + 1
             self.memory.add(resume_from)
         else:
-            current_plan = None
+            # Plan up front so the test-first suite can be generated before any
+            # implementation exists. Reuse a caller-supplied plan when given
+            # (avoids a duplicate, memory-blind planning call).
+            if plan is not None:
+                print("\n[PLAN] Using pre-computed plan")
+                current_plan = plan
+            else:
+                print("\n[PLAN] Creating plan...")
+                with self.profiler.track("planning"):
+                    current_plan = await self.planner.create_plan(goal)
+            print(f"Steps: {len(current_plan.steps)}")
+            print(f"Tests: {len(current_plan.test_cases)}")
+            if self.on_plan:
+                self.on_plan(current_plan)
+            frozen_tests = None
             iteration = 1
-        
+
+        # Eager dependency install (Docker persistent path only). The plan already
+        # declares its pip packages, so install them once up front instead of
+        # discovering them reactively via ImportErrors. This also stops
+        # dependency-recovery iterations from eating the circuit-breaker budget.
+        # Kicked off as a task so the (IO-bound) pip install overlaps the first
+        # slow LLM call — genuine concurrency even on a single-GPU backend.
+        install_task = None
+        if self.dependency_manager and not resume_from:
+            install_task = asyncio.create_task(self._eager_install(current_plan))
+
+        # Test-first: generate and validate the frozen pytest suite once. The
+        # suite is reused unchanged across fix iterations.
+        if frozen_tests is None and self._pytest_gate_enabled(current_plan):
+            frozen_tests, gate_failure = await self._prepare_frozen_tests(
+                current_plan, goal, task_id, install_task=install_task
+            )
+            install_task = None  # awaited inside _prepare_frozen_tests
+            if gate_failure is not None:
+                return gate_failure
+
+        # Legacy path had no test-generation call to overlap with — make sure the
+        # eager install finished before we start iterating.
+        if install_task is not None:
+            await install_task
+
         final_state = None
-        
+
         while iteration <= self.config.max_iterations:
             # Check circuit breaker
             if not self.circuit_breaker.can_execute():
@@ -184,7 +240,8 @@ class ExecutionLoop:
                         should_continue=False
                     ),
                     status=Status.CIRCUIT_BREAKER,
-                    task_id=task_id
+                    task_id=task_id,
+                    test_code=frozen_tests,
                 )
             
             print(f"\n{'='*60}")
@@ -197,6 +254,7 @@ class ExecutionLoop:
                     goal=goal,
                     iteration=iteration,
                     current_plan=current_plan,
+                    frozen_tests=frozen_tests,
                     task_id=task_id
                 )
                 
@@ -248,21 +306,291 @@ class ExecutionLoop:
                         should_continue=False
                     ),
                     status=Status.FAILED,
-                    task_id=task_id
+                    task_id=task_id,
+                    test_code=frozen_tests,
                 )
                 return error_state
         
         return final_state
     
+    @staticmethod
+    def _error_blob(test_results: TestResults) -> str:
+        """Combine all failure text so import errors are findable regardless of
+        whether pytest wrote them to stdout, stderr, or a collection longrepr."""
+        parts = [
+            f.get("message", "") for f in (test_results.test_failures or [])
+        ]
+        parts.append(test_results.stderr or "")
+        parts.append(test_results.stdout or "")
+        return "\n".join(p for p in parts if p)
+
+    async def _eager_install(self, plan: Plan) -> None:
+        """Install the plan's declared pip dependencies once, up front.
+
+        Best-effort and Docker-persistent only (needs a DependencyManager).
+        Failures are non-fatal — reactive ImportError recovery stays as the
+        safety net for anything the plan under-declared (e.g. fastapi naming
+        httpx implicitly). Runs the blocking install in a thread so it truly
+        overlaps the concurrent test-generation LLM call.
+        """
+        if not self.dependency_manager:
+            return
+        deps = list(getattr(plan, "dependencies", None) or [])
+        if not deps:
+            return
+        print(f"[DEPS] Pre-installing declared dependencies: {deps}")
+        try:
+            with self.profiler.track("dependency_install"):
+                result = await asyncio.to_thread(
+                    self.dependency_manager.install_packages, deps
+                )
+        except Exception as e:
+            print(f"[DEPS] Pre-install error (non-fatal): {e}")
+            return
+        if getattr(result, "success", False):
+            print(f"[DEPS] Installed {getattr(result, 'packages', deps)}")
+        else:
+            print(
+                f"[DEPS] Pre-install incomplete: {getattr(result, 'stderr', '')} "
+                "— relying on reactive recovery"
+            )
+
+    def _pytest_gate_enabled(self, plan: Plan) -> bool:
+        """
+        True when this task should be gated on a real, frozen pytest suite.
+
+        Scoped to single-file Python tasks — the `solution` module contract and
+        the stub-based vacuity check only make sense there. Multi-file / non-
+        Python tasks fall back to the legacy exit-code behavior.
+        """
+        return (
+            self.test_generator is not None
+            and getattr(plan, "language", "python") == "python"
+            and not getattr(plan, "use_multi_file", False)
+        )
+
+    async def _generate_tests(self, plan: Plan, **kwargs) -> CodeArtifact:
+        """Profiled wrapper around the test generator."""
+        with self.profiler.track("test_generation"):
+            return await self.test_generator.generate_tests(plan, **kwargs)
+
+    async def _prepare_frozen_tests(
+        self,
+        plan: Plan,
+        goal: str,
+        task_id: Optional[str],
+        install_task: Optional["asyncio.Task"] = None,
+    ) -> tuple[Optional[CodeArtifact], Optional[IterationState]]:
+        """
+        Generate, validate, and freeze the pytest suite (test-first).
+
+        Returns (tests, None) on success, or (None, failure_state) when no
+        structurally valid suite could be produced. A structurally valid but
+        *vacuous* suite (passes against an empty stub) is non-fatal: we warn and
+        proceed, because the suite is still real — we just couldn't prove it has
+        teeth (this is also the common case under a weak/mock LLM).
+
+        If `install_task` is given (eager dependency install kicked off in
+        parallel), it is awaited before any stub pytest run so the vacuity check
+        and every iteration see the declared packages.
+        """
+        print("\n[TESTS] Generating frozen pytest suite (test-first)...")
+        attempts = max(0, self.config.max_test_regenerations)
+        tests = await self._generate_tests(plan)
+
+        # The eager install ran concurrently with the LLM call above; ensure it
+        # has finished before the first stub pytest run below.
+        if install_task is not None:
+            await install_task
+
+        for i in range(attempts + 1):
+            ok, reasons = static_check_test_code(tests.source, MODULE_NAME)
+            if not ok:
+                print(f"  Test suite rejected (structure): {'; '.join(reasons)}")
+                if i < attempts:
+                    tests = await self._generate_tests(
+                        plan, previous_tests=tests.source, feedback="; ".join(reasons)
+                    )
+                    continue
+                # Exhausted retries with an unusable suite — fatal.
+                return None, self._gate_failure_state(
+                    plan, goal, task_id,
+                    "Could not generate a structurally valid pytest suite: "
+                    + "; ".join(reasons),
+                )
+
+            # Structurally valid — now check the tests actually have teeth.
+            vacuous = await self._tests_pass_against_stub(tests, plan)
+            if vacuous:
+                print("  Test suite is vacuous (passes against an empty stub).")
+                if i < attempts:
+                    tests = await self._generate_tests(
+                        plan,
+                        previous_tests=tests.source,
+                        feedback="the tests pass against an empty implementation; "
+                                 "assert concrete behaviour so a stub fails them",
+                    )
+                    continue
+                # Best-effort: proceed but flag it.
+                print("  ⚠️  Proceeding with a vacuity warning.")
+                tests.metadata["vacuity_warning"] = True
+                return tests, None
+
+            print(f"  Frozen suite accepted: {tests.file_path}")
+            return tests, None
+
+        return tests, None
+
+    async def _tests_pass_against_stub(self, tests: CodeArtifact, plan: Plan) -> bool:
+        """Run the frozen suite against an empty stub; True means the tests are vacuous."""
+        try:
+            stub_files = build_stub_files(tests.source, MODULE_NAME)
+            with self.profiler.track("vacuity_check"):
+                result = await self.tester.run_pytest(
+                    stub_files, {tests.file_path: tests.source}
+                )
+            return result.passed
+        except Exception as e:
+            # If we can't run the stub check, don't block — we just can't prove
+            # vacuity either way.
+            print(f"  (stub vacuity check skipped: {e})")
+            return False
+
+    def _gate_failure_state(
+        self, plan: Plan, goal: str, task_id: Optional[str], reason: str
+    ) -> IterationState:
+        return self._create_final_state(
+            iteration=0,
+            plan=plan,
+            code=CodeArtifact(source="", file_path=f"{MODULE_NAME}.py", language="python"),
+            test_results=TestResults(passed=False, stderr=reason, error_type="TestGenerationError"),
+            reflection=Reflection(success=False, analysis=reason, should_continue=False),
+            status=Status.FAILED,
+            task_id=task_id,
+        )
+
     async def _run_iteration(
+        self,
+        goal: str,
+        iteration: int,
+        current_plan: Plan,
+        frozen_tests: Optional[CodeArtifact],
+        task_id: Optional[str],
+    ) -> IterationState:
+        """Dispatch to the real-pytest path or the legacy exit-code path."""
+        if frozen_tests is not None and self._pytest_gate_enabled(current_plan):
+            return await self._run_iteration_pytest(
+                goal, iteration, current_plan, frozen_tests, task_id
+            )
+        return await self._run_iteration_legacy(goal, iteration, current_plan, task_id)
+
+    async def _run_iteration_pytest(
+        self,
+        goal: str,
+        iteration: int,
+        current_plan: Plan,
+        frozen_tests: CodeArtifact,
+        task_id: Optional[str],
+    ) -> IterationState:
+        """One iteration gated on the frozen pytest suite (single-file Python)."""
+        print("\n[EXECUTE] Generating implementation...")
+        previous_code = self.memory.get_last_code()
+        last_reflection = self.memory.get_last_reflection()
+
+        is_fix = bool(previous_code and last_reflection and not last_reflection.success)
+        with self.profiler.track("code_generation"):
+            if is_fix:
+                code = await self.code_generator.generate_fix(
+                    plan=current_plan,
+                    broken_code=previous_code,
+                    error_type=(last_reflection.error_signature.error_type
+                                if last_reflection.error_signature else "TestFailure"),
+                    error_message=(last_reflection.error_signature.error_message
+                                   if last_reflection.error_signature else ""),
+                    reflection=last_reflection.analysis,
+                    test_code=frozen_tests.source,
+                )
+            else:
+                code = await self.code_generator.generate(
+                    plan=current_plan,
+                    previous_attempt=previous_code,
+                    error_feedback=last_reflection.suggested_fix if last_reflection else None,
+                    test_code=frozen_tests.source,
+                )
+        print(f"Generated {len(code.source)} characters -> {code.file_path}")
+        if self.on_code:
+            self.on_code(code)
+
+        # PHASE 3: TEST (real pytest against the frozen suite)
+        print("\n[TEST] Running frozen pytest suite...")
+        impl_files = {code.file_path: code.source}
+        test_files = {frozen_tests.file_path: frozen_tests.source}
+        with self.profiler.track("pytest_run"):
+            test_results = await self.tester.run_pytest(impl_files, test_files)
+
+        # Dependency recovery: a missing third-party package shows up as a
+        # collection ImportError. pytest writes that to the collection longrepr /
+        # stdout (not stderr), so search the combined output for the package.
+        if not test_results.passed:
+            is_import_error = test_results.error_type in ("ModuleNotFoundError", "ImportError")
+            err_blob = self._error_blob(test_results)
+            if (
+                self.dependency_manager and is_import_error
+                and self.dependency_manager.should_attempt_recovery(err_blob)
+            ):
+                packages = self.dependency_manager.extract_packages_from_error(err_blob)
+                print(f"Missing dependency detected: {packages}. Installing...")
+                with self.profiler.track("dependency_install"):
+                    recovery = self.dependency_manager.handle_import_error(err_blob, code.source)
+                if recovery.attempted and recovery.success:
+                    print(f"Installed {recovery.packages_installed}. Retrying...")
+                    with self.profiler.track("pytest_run"):
+                        test_results = await self.tester.run_pytest(impl_files, test_files)
+            print(
+                f"pytest: collected={test_results.tests_collected} "
+                f"passed={test_results.tests_passed} failed={test_results.tests_failed} "
+                f"errors={test_results.tests_errors}"
+            )
+
+        if self.on_test:
+            self.on_test(test_results)
+
+        # PHASE 4: REFLECT
+        print("\n[REFLECT] Analyzing results...")
+        with self.profiler.track("reflection"):
+            reflection = await self.reflector.analyze(
+                test_results=test_results,
+                code=code,
+                plan=current_plan,
+                iteration=iteration,
+                previous_reflections=[s.reflection for s in self.memory.get_recent(3)],
+            )
+        if reflection.suggested_fix:
+            print(f"Suggested fix: {reflection.suggested_fix[:100]}...")
+        if self.on_reflect:
+            self.on_reflect(reflection)
+
+        status = self._determine_status(test_results, reflection, iteration)
+        return self._create_final_state(
+            iteration=iteration,
+            plan=current_plan,
+            code=code,
+            test_results=test_results,
+            reflection=reflection,
+            status=status,
+            task_id=task_id,
+            test_code=frozen_tests,
+        )
+
+    async def _run_iteration_legacy(
         self,
         goal: str,
         iteration: int,
         current_plan: Optional[Plan],
         task_id: Optional[str]
     ) -> IterationState:
-        """Run a single iteration of the loop."""
-        
+        """Run a single iteration of the loop (legacy exit-code behavior)."""
+
         # PHASE 1: PLAN
         if current_plan is None:
             print("\n[PLAN] Creating plan...")
@@ -346,33 +674,53 @@ class ExecutionLoop:
             current_plan, 
             run_from_workspace=is_multi_file
         )
-        print(f"Passed: {test_results.passed}")
         
+        # Phase 2: Automatic package installation recovery (Docker persistent mode).
+        # Missing dependencies on the *first* run are expected — we recover automatically
+        # instead of treating them as hard failures.
         if not test_results.passed:
-            print(f"Error: {test_results.error_type}")
-            if test_results.stderr:
-                print(f"Details: {test_results.stderr[:200]}...")
+            is_import_error = test_results.error_type in ("ModuleNotFoundError", "ImportError")
+            can_recover = (
+                self.dependency_manager 
+                and is_import_error
+                and self.dependency_manager.should_attempt_recovery(test_results.stderr)
+            )
             
-            # Phase 2: Automatic package installation recovery
-            if self.dependency_manager and test_results.error_type in ("ModuleNotFoundError", "ImportError"):
-                if self.dependency_manager.should_attempt_recovery(test_results.stderr):
-                    recovery = self.dependency_manager.handle_import_error(test_results.stderr, code.source)
-                    if recovery.attempted:
-                        if recovery.success:
-                            print(f"Successfully installed {recovery.packages_installed}. Retrying execution...")
-                            test_results = await self.tester.run_tests(code, current_plan)
-                            print(f"Retry Passed: {test_results.passed}")
+            if can_recover:
+                # Friendly path for the common case (FastAPI, pandas, etc. on first run)
+                packages = self.dependency_manager.extract_packages_from_error(test_results.stderr)
+                print(f"Missing dependency detected: {packages}. Installing inside container...")
+                recovery = self.dependency_manager.handle_import_error(test_results.stderr, code.source)
+                if recovery.attempted:
+                    if recovery.success:
+                        print(f"Successfully installed {recovery.packages_installed}. Retrying...")
+                        test_results = await self.tester.run_tests(
+                            code, current_plan, run_from_workspace=is_multi_file
+                        )
+                        if test_results.passed:
+                            print("Retry passed.")
                         else:
-                            print(f"Package installation failed: {recovery.error}")
-            # Legacy fallback (if no DependencyManager is wired)
-            elif self.install_packages and test_results.error_type in ("ModuleNotFoundError", "ImportError"):
+                            print(f"Retry still failing (passed={test_results.passed}).")
+                    else:
+                        print(f"Package installation failed: {recovery.error}")
+            elif self.install_packages and is_import_error:
+                # Legacy fallback (non-Docker or older path)
                 package = self._extract_package_name(test_results.stderr)
                 if package:
                     print(f"Attempting to install missing package: {package}")
                     if self.install_packages([package]):
-                        print(f"Successfully installed {package}. Retrying execution...")
-                        test_results = await self.tester.run_tests(code, current_plan)
-                        print(f"Retry Passed: {test_results.passed}")
+                        print(f"Successfully installed {package}. Retrying...")
+                        test_results = await self.tester.run_tests(
+                            code, current_plan, run_from_workspace=is_multi_file
+                        )
+                        print(f"Retry passed: {test_results.passed}")
+            else:
+                # Genuine failure (not a recoverable import error, or recovery exhausted)
+                print(f"Passed: {test_results.passed}")
+                if test_results.error_type:
+                    print(f"Error: {test_results.error_type}")
+                if test_results.stderr:
+                    print(f"Details: {test_results.stderr[:300]}...")
         
         if self.on_test:
             self.on_test(test_results)
@@ -454,7 +802,8 @@ class ExecutionLoop:
         test_results: TestResults,
         reflection: Reflection,
         status: Status,
-        task_id: Optional[str] = None
+        task_id: Optional[str] = None,
+        test_code: Optional[CodeArtifact] = None,
     ) -> IterationState:
         """Create an iteration state object."""
         return IterationState(
@@ -464,7 +813,8 @@ class ExecutionLoop:
             test_results=test_results,
             reflection=reflection,
             status=status,
-            task_id=task_id
+            task_id=task_id,
+            test_code=test_code,
         )
     
     def get_stats(self) -> dict:

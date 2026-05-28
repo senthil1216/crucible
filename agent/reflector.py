@@ -42,7 +42,11 @@ Respond in valid JSON format:
     "confidence": 0.8
 }
 
-Be honest about confidence. If the error seems hopeless or unclear, set should_continue to false."""
+Be honest about confidence. If the error seems hopeless or unclear, set should_continue to false.
+
+If a test suite is shown, treat it as a fixed, authoritative specification: never
+suggest modifying, relaxing, or rewriting the tests. The fix must always change the
+code under test so it satisfies the tests exactly as written."""
 
     LEARNING_SYSTEM_PROMPT = """You are reviewing a coding task that just succeeded.
 Extract 0–3 short, reusable lessons that would help on similar future tasks.
@@ -211,7 +215,36 @@ If nothing non-obvious was learned, return {"learnings": []}."""
             "Standard Error:",
             test_results.stderr[:1000] if test_results.stderr else "(empty)",
         ]
-        
+
+        # When the result came from a real pytest run, the per-test failures are
+        # far more actionable than the raw streams — surface them explicitly.
+        if getattr(test_results, "from_pytest", False):
+            lines.extend([
+                "",
+                "IMPORTANT: The pytest suite is the FROZEN, authoritative specification "
+                "for this task. It is immutable — do NOT suggest changing, relaxing, or "
+                "rewriting any test or assertion. Diagnose why the IMPLEMENTATION fails "
+                "and propose a fix to the implementation only. If a test expects a "
+                "specific output shape (e.g. plain text vs JSON, or an exact string), "
+                "change the implementation to produce exactly that.",
+                "",
+                "Pytest Summary:",
+                f"collected={test_results.tests_collected} "
+                f"passed={test_results.tests_passed} "
+                f"failed={test_results.tests_failed} "
+                f"errors={test_results.tests_errors}",
+            ])
+            if test_results.tests_collected == 0:
+                lines.append(
+                    "No tests were collected — the suite failed to import or is empty."
+                )
+            for failure in (test_results.test_failures or [])[:4]:
+                lines.extend([
+                    "",
+                    f"FAILED {failure.get('nodeid', '?')} ({failure.get('outcome', '')}):",
+                    (failure.get("message", "") or "")[:600],
+                ])
+
         if similar_failures:
             lines.extend([
                 "",

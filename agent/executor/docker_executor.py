@@ -30,7 +30,8 @@ except ImportError:
 
 from agent.models import CodeArtifact, TestResults
 from agent.safety.checker import SafetyChecker
-from agent.executor.sandbox import ExecutionConfig
+from agent.executor.sandbox import ExecutionConfig, _is_test_path
+from agent.pytest_report import build_test_results
 
 
 class DockerExecutor:
@@ -86,12 +87,19 @@ class DockerExecutor:
     # Phase 2: Persistent Container Support (Restricted Scope)
     # ==================================================================
 
-    def start_persistent(self, workspace_id: Optional[str] = None) -> None:
+    def start_persistent(
+        self, workspace_id: Optional[str] = None, publish_port: Optional[int] = None
+    ) -> None:
         """
         Start a long-lived container for the entire task with a dedicated workspace.
 
         The workspace will be created at /workspace/<workspace_id>/ inside the container.
         Safe to call multiple times (idempotent / re-entrant).
+
+        If `publish_port` is given, that container port is published to the same
+        host port so a server started inside the container is reachable from the
+        host. Port mapping must be set at creation time, so this is a no-op on a
+        re-entrant call to an already-running container.
         """
         if workspace_id is None:
             workspace_id = "default"
@@ -114,6 +122,8 @@ class DockerExecutor:
             "network_disabled": not self.enable_network,
             "working_dir": self._workspace_path,
         }
+        if publish_port is not None:
+            run_kwargs["ports"] = {f"{publish_port}/tcp": publish_port}
 
         container = self.client.containers.run(**run_kwargs)
         self._persistent_container = container
@@ -141,6 +151,26 @@ class DockerExecutor:
             pass
         self._persistent_container = None
 
+    def launch_app(self, command: str) -> None:
+        """
+        Start a long-running command (e.g. a web server) detached in the workspace.
+
+        Returns immediately; the process keeps running inside the container until
+        the container is stopped. Output is not captured (it's a server, not a
+        one-shot command).
+        """
+        if not self.persistent or not self._persistent_container or not self._workspace_path:
+            raise RuntimeError("launch_app requires a running persistent container.")
+        self._persistent_container.exec_run(
+            command, workdir=self._workspace_path, detach=True
+        )
+
+    def get_container_short_id(self) -> Optional[str]:
+        """Short Docker id of the persistent container (for stop instructions)."""
+        if self._persistent_container is None:
+            return None
+        return self._persistent_container.short_id
+
     def install_packages(self, packages: list[str]) -> bool:
         """
         Install Python packages inside the persistent container.
@@ -167,14 +197,30 @@ class DockerExecutor:
         return True
 
     def _run_setup_commands(self) -> None:
-        """Run one-time setup inside the persistent container (richer environment)."""
+        """Run one-time setup inside the persistent container (richer environment).
+
+        If the image is already provisioned (e.g. the prebaked `crucible-runtime`
+        image, which bakes the C toolchain + pytest tooling), this detects the
+        tooling and skips the expensive apt/pip work entirely — dropping per-task
+        container_setup from ~15s to ~1s.
+        """
         if not self._persistent_container:
+            return
+
+        # Fast path: tooling already present (prebaked image) → skip setup.
+        check = self._persistent_container.exec_run(
+            ["python", "-c", "import pytest, pytest_jsonreport"]
+        )
+        if getattr(check, "exit_code", 1) == 0:
+            self._log("Test tooling already present in image; skipping container setup.")
             return
 
         commands = [
             "apt-get update -qq",
             "apt-get install -y --no-install-recommends build-essential gcc python3-dev",
             "pip install --upgrade pip setuptools wheel",
+            # Needed for the real-pytest success gate.
+            "pip install --no-cache-dir pytest pytest-json-report",
         ]
 
         for cmd in commands:
@@ -382,6 +428,59 @@ class DockerExecutor:
         Defaults to pytest.
         """
         return self.run_command_in_workspace(command)
+
+    async def run_pytest(self, files: dict[str, str]) -> TestResults:
+        """
+        Write `files` into the persistent workspace and run a real pytest suite.
+
+        Mirrors SandboxedExecutor.run_pytest so the loop can stay
+        executor-agnostic. Requires persistent mode (a long-lived workspace);
+        ephemeral containers return a clear failure instead of a hollow pass.
+        """
+        impl_blob = "\n\n".join(
+            src for path, src in files.items() if not _is_test_path(path)
+        )
+        safety_report = self.safety_checker.analyze(
+            CodeArtifact(source=impl_blob, file_path="solution.py", language="python")
+        )
+        if safety_report.level.value == "dangerous":
+            return TestResults(
+                passed=False,
+                stderr=f"Safety violation: {safety_report.warnings}",
+                exit_code=-2,
+                error_type="SafetyError",
+            )
+
+        if not (self.persistent and self._persistent_container):
+            return TestResults(
+                passed=False,
+                stderr=(
+                    "Docker pytest gating requires persistent mode. "
+                    "Run with --docker-persistent."
+                ),
+                exit_code=-1,
+                error_type="DockerExecutionError",
+                from_pytest=True,
+            )
+
+        return await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self._run_pytest_sync(files)
+        )
+
+    def _run_pytest_sync(self, files: dict[str, str]) -> TestResults:
+        start_time = time.time()
+        self.write_files(files)
+        report_rel = ".report.json"
+        cmd = (
+            f"python -m pytest . -p no:cacheprovider "
+            f"--json-report --json-report-file={report_rel} -q"
+        )
+        exit_code, stdout, stderr = self.run_command_in_workspace(cmd)
+        report_text = self.read_file(report_rel)
+        return build_test_results(
+            report_text, stdout, stderr, exit_code,
+            execution_time=time.time() - start_time,
+        )
 
     def capture_environment(self) -> dict:
         """

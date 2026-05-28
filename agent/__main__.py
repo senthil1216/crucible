@@ -4,13 +4,14 @@ CLI entry point for the self-improving coding agent.
 
 import asyncio
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from agent.core import SelfImprovingAgent
 from agent.llm_clients import (
-    MockLLMClient, OpenAIClient, AnthropicClient, 
-    KimiClient, DeepSeekClient, OllamaClient
+    MockLLMClient, OpenAIClient, AnthropicClient,
+    KimiClient, DeepSeekClient, OllamaClient, XAIClient
 )
 from agent.models import AgentConfig, LoopConfig
 
@@ -36,9 +37,9 @@ def create_parser() -> argparse.ArgumentParser:
     
     parser.add_argument(
         "--llm",
-        choices=["mock", "openai", "anthropic", "kimi", "deepseek", "ollama"],
-        default="mock",
-        help="LLM provider to use"
+        choices=["mock", "openai", "anthropic", "kimi", "deepseek", "ollama", "xai"],
+        default=os.getenv("AGENT_LLM", "ollama"),
+        help="LLM provider to use (default: ollama, or $AGENT_LLM)"
     )
     
     parser.add_argument(
@@ -85,8 +86,10 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--docker-image",
-        default="python:3.12-slim",
-        help="Docker image to use when --docker is enabled"
+        default=os.getenv("AGENT_DOCKER_IMAGE", "python:3.12-slim"),
+        help="Docker image to use when --docker is enabled "
+             "(default: python:3.12-slim, or $AGENT_DOCKER_IMAGE; "
+             "use the prebaked 'crucible-runtime' to skip per-task setup)"
     )
 
     parser.add_argument(
@@ -94,7 +97,21 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use one persistent container for the whole task (enables pip install etc.)"
     )
-    
+
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="After a server task passes its tests, launch it and leave it running "
+             "(reachable on http://localhost:<port>). Requires --docker-persistent."
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Host port to publish the running app on (with --run). Default: 8000"
+    )
+
     return parser
 
 
@@ -120,9 +137,13 @@ def create_llm_client(args):
         return DeepSeekClient(model=model)
     
     elif args.llm == "ollama":
-        model = args.model or "qwen2.5-coder:7b"
+        model = args.model or os.getenv("AGENT_OLLAMA_MODEL", "qwen2.5-coder:7b")
         return OllamaClient(model=model)
-    
+
+    elif args.llm == "xai":
+        model = args.model or os.getenv("XAI_MODEL", "grok-4.3")
+        return XAIClient(model=model)
+
     else:
         raise ValueError(f"Unknown LLM: {args.llm}")
 
@@ -133,12 +154,18 @@ async def main():
     args = parser.parse_args()
     
     # Create configuration
+    if args.run and not args.docker_persistent:
+        print("⚠️  --run requires --docker-persistent; ignoring --run.")
+        args.run = False
+
     config = AgentConfig(
         loop=LoopConfig(max_iterations=args.max_iterations),
         workspace_path=args.workspace,
         use_docker=args.docker,
         docker_image=args.docker_image,
         docker_persistent=args.docker_persistent,
+        run_app=args.run,
+        app_port=args.port,
     )
     
     # Create LLM client
