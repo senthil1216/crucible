@@ -289,6 +289,23 @@ class SelfImprovingAgent:
                     retrieved_learning_ids
                 )
 
+            # Track D: surface falsifiable predictions from similar past
+            # failures. Best-effort — if prediction_memory isn't configured
+            # or retrieval errors, planning continues unaffected.
+            relevant_predictions = []
+            if self.prediction_memory is not None:
+                try:
+                    relevant_predictions = await self.prediction_memory.find_relevant(
+                        goal, k=3
+                    )
+                except Exception as e:
+                    print(f"⚠️  Prediction retrieval failed (non-fatal): {e}")
+                if relevant_predictions:
+                    print(
+                        f"🎯 Surfaced {len(relevant_predictions)} prediction(s) "
+                        f"from similar past failures"
+                    )
+
             # Plan once, here, using retrieved memories, and hand it to the loop
             # so it doesn't plan again. (Resuming reuses the checkpoint's plan, so
             # skip planning entirely in that case.)
@@ -296,7 +313,10 @@ class SelfImprovingAgent:
             if resume_from is None:
                 with self.profiler.track("planning"):
                     plan = await self.planner.create_plan(
-                        goal, similar_solutions, relevant_learnings=relevant_learnings
+                        goal,
+                        similar_solutions,
+                        relevant_learnings=relevant_learnings,
+                        relevant_predictions=relevant_predictions,
                     )
 
             # Run the execution loop (reusing the memory-informed plan)
