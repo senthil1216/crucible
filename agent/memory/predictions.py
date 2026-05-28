@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.models import MemoryEntry, Prediction
+from agent.memory.embeddings import EmbeddingClient, cosine_similarity
 
 
 class PredictionMemory:
@@ -32,10 +33,21 @@ class PredictionMemory:
     mirrors FailureMemory's structure.
     """
 
-    def __init__(self, storage_path: Path):
+    # Max bonus added to a prediction's similarity score based on its
+    # confirmation history. Same shape as LongTermMemory's usefulness
+    # bonus; neutral (rate=0.5 → bonus=0) until phase 2's replay engine
+    # produces confirmation data.
+    _CONFIRMATION_BONUS_MAX = 0.10
+
+    def __init__(
+        self,
+        storage_path: Path,
+        embedding_client: Optional[EmbeddingClient] = None,
+    ):
         self.storage_path = storage_path
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.predictions_file = storage_path / "predictions.jsonl"
+        self._embeddings = embedding_client or EmbeddingClient.shared()
         self._cache: List[MemoryEntry] = []
         self._load_cache()
 
@@ -71,14 +83,24 @@ class PredictionMemory:
         prediction fails the schema gate (no concrete trigger_input).
 
         ID is derived from (source_failure_id, trigger_input) so identical
-        predictions emitted twice deduplicate naturally."""
+        predictions emitted twice deduplicate naturally. The source_goal
+        is embedded at store time and stored alongside so future tasks
+        can retrieve predictions by semantic goal similarity."""
         if not prediction.is_well_formed():
             return None
 
         seed = f"{prediction.source_failure_id}:{prediction.trigger_input}"
         prediction_id = hashlib.sha256(seed.encode()).hexdigest()[:16]
 
-        entry = MemoryEntry(id=prediction_id, content=prediction.to_dict())
+        content = prediction.to_dict()
+        # Embed the source_goal so we can retrieve by semantic similarity
+        # when a new task's goal resembles a past failure context.
+        goal_text = prediction.source_goal or ""
+        content["goal_embedding"] = (
+            self._embeddings.encode(goal_text) if goal_text else []
+        )
+
+        entry = MemoryEntry(id=prediction_id, content=content)
         # Dedupe in-memory: if we already have this id, skip the append.
         for existing in self._cache:
             if existing.id == prediction_id:
@@ -86,6 +108,77 @@ class PredictionMemory:
         self._cache.append(entry)
         self._save_entry(entry)
         return prediction_id
+
+    def _get_goal_embedding(self, entry: MemoryEntry) -> List[float]:
+        """Return the cached source_goal embedding, computing it lazily
+        for legacy entries written before we stored embeddings."""
+        emb = entry.content.get("goal_embedding")
+        if emb:
+            return emb
+        goal_text = entry.content.get("source_goal") or ""
+        emb = self._embeddings.encode(goal_text) if goal_text else []
+        entry.content["goal_embedding"] = emb
+        return emb
+
+    async def find_relevant(
+        self,
+        goal: str,
+        k: int = 3,
+        min_similarity: float = 0.3,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return predictions whose source_goal is semantically similar to
+        the given goal. Used by the Planner to surface "on a similar past
+        task, this concrete input triggered this error type" context.
+
+        Score = cosine(query_goal, stored_goal) + confirmation_bonus.
+        Threshold is applied to raw cosine, not boosted score, so a
+        well-confirmed prediction can't sneak past a semantic mismatch.
+
+        Until phase 2's replay engine runs, all predictions sit at
+        confirmation_rate=0.5 (Laplace prior) → bonus=0. Wired now so
+        phase 2 only needs to bump counters; retrieval ranking adapts
+        automatically.
+        """
+        if not self._cache or not goal:
+            return []
+
+        query_emb = self._embeddings.encode(goal)
+
+        scored: List[tuple] = []
+        for entry in self._cache:
+            entry_emb = self._get_goal_embedding(entry)
+            if not entry_emb:
+                continue
+            similarity = cosine_similarity(query_emb, entry_emb)
+            if similarity < min_similarity:
+                continue
+
+            times_tested = int(entry.content.get("times_tested", 0) or 0)
+            times_confirmed = int(entry.content.get("times_confirmed", 0) or 0)
+            rate = (times_confirmed + 1) / (times_tested + 2)
+            bonus = (rate - 0.5) * 2 * self._CONFIRMATION_BONUS_MAX
+            score = similarity + bonus
+            scored.append((score, similarity, bonus, entry))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        results: List[Dict[str, Any]] = []
+        for score, similarity, bonus, entry in scored[:k]:
+            results.append({
+                "id": entry.id,
+                "similarity": similarity,
+                "score": score,
+                "confirmation_bonus": bonus,
+                "trigger_input": entry.content.get("trigger_input"),
+                "predicted_error_type": entry.content.get("predicted_error_type"),
+                "predicted_explanation": entry.content.get("predicted_explanation", ""),
+                "confidence": entry.content.get("confidence", 0.5),
+                "source_failure_id": entry.content.get("source_failure_id"),
+                "source_goal": entry.content.get("source_goal"),
+                "times_tested": int(entry.content.get("times_tested", 0) or 0),
+                "times_confirmed": int(entry.content.get("times_confirmed", 0) or 0),
+            })
+        return results
 
     def find_by_failure_id(self, failure_id: str) -> List[Dict[str, Any]]:
         """All predictions linked to a given failure. Used by phase 2's

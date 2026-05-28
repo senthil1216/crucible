@@ -6,16 +6,43 @@ loop. Phase 2 (replay engine) will write back times_tested /
 times_confirmed; this file only covers the storage and emission paths.
 """
 
+import hashlib
 import json
+import math
 import shutil
 import tempfile
 from pathlib import Path
+from typing import List
 
 import pytest
 
+from agent.memory.embeddings import EmbeddingClient
 from agent.memory.predictions import PredictionMemory
 from agent.models import CodeArtifact, ErrorSignature, Plan, Prediction
+from agent.planner import Planner
 from agent.reflector import Reflector
+
+
+class FakeEmbeddingClient(EmbeddingClient):
+    """Same deterministic, model-free embedding used in test_memory.py.
+    Tokens hash to fixed positions so semantically-similar text
+    (shared tokens) → higher cosine. Fast, no network, no torch."""
+
+    DIM = 64
+
+    def __init__(self):
+        super().__init__(model_name="fake")
+
+    def _ensure_loaded(self) -> None:
+        return
+
+    def encode(self, text: str) -> List[float]:
+        vec = [0.0] * self.DIM
+        for token in (text or "").lower().split():
+            idx = int(hashlib.sha256(token.encode()).hexdigest(), 16) % self.DIM
+            vec[idx] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec))
+        return [v / norm for v in vec] if norm else vec
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +306,163 @@ class TestReflectorExtractPredictions:
             source_failure_id="ff", task_id="tt",
         )
         assert preds == []
+
+
+# ---------------------------------------------------------------------------
+# Semantic retrieval — surfacing predictions to the Planner.
+# ---------------------------------------------------------------------------
+
+
+class TestPredictionFindRelevant:
+    @pytest.mark.asyncio
+    async def test_finds_semantically_similar_goal(self, tmp_predictions_dir):
+        mem = PredictionMemory(tmp_predictions_dir, embedding_client=FakeEmbeddingClient())
+        await mem.store(Prediction(
+            trigger_input="-1",
+            predicted_error_type="ValueError",
+            source_failure_id="f1",
+            source_goal="compute square root of a number",
+        ))
+        await mem.store(Prediction(
+            trigger_input="None",
+            predicted_error_type="TypeError",
+            source_failure_id="f2",
+            source_goal="parse a json string from input",
+        ))
+
+        # Query that shares tokens with the first goal but not the second.
+        results = await mem.find_relevant(
+            "compute square root for input number", min_similarity=0.0
+        )
+        assert len(results) >= 1
+        # Top result should be the sqrt one.
+        assert results[0]["trigger_input"] == "-1"
+        assert results[0]["source_goal"] == "compute square root of a number"
+
+    @pytest.mark.asyncio
+    async def test_empty_goal_returns_empty(self, tmp_predictions_dir):
+        mem = PredictionMemory(tmp_predictions_dir, embedding_client=FakeEmbeddingClient())
+        await mem.store(Prediction(
+            trigger_input="-1",
+            predicted_error_type="ValueError",
+            source_failure_id="f1",
+            source_goal="anything",
+        ))
+        assert await mem.find_relevant("") == []
+
+    @pytest.mark.asyncio
+    async def test_threshold_filters_low_similarity(self, tmp_predictions_dir):
+        mem = PredictionMemory(tmp_predictions_dir, embedding_client=FakeEmbeddingClient())
+        await mem.store(Prediction(
+            trigger_input="-1",
+            predicted_error_type="ValueError",
+            source_failure_id="f1",
+            source_goal="parse xml documents",
+        ))
+        # Query with no shared tokens. With FakeEmbeddings, cosine should
+        # be 0, dropped by the default min_similarity threshold.
+        results = await mem.find_relevant("write a fastapi web service")
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_entries_without_embedding_lazy_backfill(self, tmp_predictions_dir):
+        # Write a legacy entry directly to disk with no goal_embedding key.
+        from datetime import datetime as _dt
+        legacy = {
+            "id": "legacy_pred_1",
+            "content": {
+                "trigger_input": "[]",
+                "predicted_error_type": "IndexError",
+                "predicted_explanation": "",
+                "confidence": 0.7,
+                "source_failure_id": "fold",
+                "source_task_id": "told",
+                "source_goal": "compute first element of a list",
+                "language": "python",
+                "timestamp": _dt.now().isoformat(),
+                "times_tested": 0,
+                "times_confirmed": 0,
+                # Intentionally no goal_embedding.
+            },
+            "timestamp": _dt.now().isoformat(),
+            "metadata": {},
+        }
+        with open(tmp_predictions_dir / "predictions.jsonl", "w") as f:
+            f.write(json.dumps(legacy) + "\n")
+
+        mem = PredictionMemory(tmp_predictions_dir, embedding_client=FakeEmbeddingClient())
+        results = await mem.find_relevant(
+            "compute first element of list", min_similarity=0.0
+        )
+        assert len(results) == 1
+        assert results[0]["trigger_input"] == "[]"
+
+    @pytest.mark.asyncio
+    async def test_caps_at_k(self, tmp_predictions_dir):
+        mem = PredictionMemory(tmp_predictions_dir, embedding_client=FakeEmbeddingClient())
+        for i in range(5):
+            await mem.store(Prediction(
+                trigger_input=f"input_{i}",
+                predicted_error_type="ValueError",
+                source_failure_id=f"f{i}",
+                source_goal="compute square root of a number",
+            ))
+        results = await mem.find_relevant(
+            "compute square root", k=2, min_similarity=0.0
+        )
+        assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Planner integration.
+# ---------------------------------------------------------------------------
+
+
+class StubPlanLLM:
+    """LLM stub that captures the prompt and returns a minimal plan JSON."""
+    def __init__(self):
+        self.last_prompt: str | None = None
+
+    async def complete(self, prompt: str, system: str = None, temperature: float = 0.7) -> str:
+        self.last_prompt = prompt
+        return json.dumps({
+            "steps": ["step 1"],
+            "test_cases": ["test 1"],
+            "language": "python",
+            "project_type": "general",
+        })
+
+
+class TestPlannerRendersPredictions:
+    @pytest.mark.asyncio
+    async def test_predictions_appear_in_prompt(self):
+        llm = StubPlanLLM()
+        planner = Planner(llm=llm, memory=None)
+        preds = [
+            {
+                "trigger_input": "-1",
+                "predicted_error_type": "ValueError",
+                "predicted_explanation": "Negative not handled.",
+            },
+            {
+                "trigger_input": "''",
+                "predicted_error_type": "IndexError",
+                "predicted_explanation": "Empty string indexed.",
+            },
+        ]
+        plan = await planner.create_plan(
+            "compute square root", relevant_predictions=preds
+        )
+        assert "Known failure modes" in llm.last_prompt
+        assert "-1" in llm.last_prompt
+        assert "ValueError" in llm.last_prompt
+        assert "Negative not handled" in llm.last_prompt
+        assert plan.context.get("predictions_surfaced") == 2
+
+    @pytest.mark.asyncio
+    async def test_no_predictions_no_section(self):
+        llm = StubPlanLLM()
+        planner = Planner(llm=llm, memory=None)
+        plan = await planner.create_plan("compute square root")
+        assert "Known failure modes" not in (llm.last_prompt or "")
+        assert plan.context.get("predictions_surfaced") == 0

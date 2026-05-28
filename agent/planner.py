@@ -56,6 +56,7 @@ Guidelines:
         goal: str,
         similar_solutions: List[Dict[str, Any]] = None,
         relevant_learnings: List[Dict[str, Any]] = None,
+        relevant_predictions: List[Dict[str, Any]] = None,
     ) -> Plan:
         """
         Create a plan for achieving the goal.
@@ -66,12 +67,32 @@ Guidelines:
             relevant_learnings: Optional list of structured Learnings retrieved
                 from long-term memory (Phase B/C). Surfaced verbatim so the
                 planner can apply concrete, transferable advice.
+            relevant_predictions: Optional list of Predictions (Track D) emitted
+                on similar past failures. Each is a concrete adversarial input
+                paired with the exception type it should trigger if mishandled —
+                actionable signal that tells the planner what corner cases to
+                cover defensively.
 
         Returns:
             Plan object with steps and test cases
         """
         # Build prompt with context from similar solutions
         prompt_parts = [f"Goal: {goal}\n"]
+
+        # Predictions go first — they're the most actionable: concrete corner
+        # cases that broke similar past code. The model should see them before
+        # the more abstract "lessons" or example-approach sections.
+        if relevant_predictions:
+            prompt_parts.append(
+                "\nKnown failure modes from similar past tasks. Cover each "
+                "of these defensively in the plan:"
+            )
+            for pred in relevant_predictions[:5]:
+                trig = pred.get("trigger_input", "?")
+                err = pred.get("predicted_error_type", "?")
+                why = (pred.get("predicted_explanation") or "").strip()
+                tail = f" — {why}" if why else ""
+                prompt_parts.append(f"- input {trig} should NOT raise {err}{tail}")
 
         if relevant_learnings:
             prompt_parts.append("\nRelevant lessons from past successful tasks:")
@@ -112,6 +133,7 @@ Guidelines:
                 "estimated_complexity": data.get("estimated_complexity", "medium"),
                 "similar_examples_used": len(similar_solutions) if similar_solutions else 0,
                 "learnings_surfaced": len(relevant_learnings) if relevant_learnings else 0,
+                "predictions_surfaced": len(relevant_predictions) if relevant_predictions else 0,
             },
             project_type=data.get("project_type", "general"),
             use_multi_file=data.get("use_multi_file", False),
