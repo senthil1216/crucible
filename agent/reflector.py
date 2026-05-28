@@ -144,16 +144,18 @@ If nothing non-obvious was learned, return {"learnings": []}."""
             confidence=analysis.get("confidence", 0.5)
         )
         
-        # Store in failure memory if it's a real failure
+        # Store in failure memory if it's a real failure. The loop reads
+        # reflection.failure_id on the next iteration's success to mark this
+        # entry was_fixed=True.
         if not test_results.passed and self.failure_memory:
-            await self.failure_memory.store_failure(
+            reflection.failure_id = await self.failure_memory.store_failure(
                 error_signature=error_sig,
                 attempt=code,
                 root_cause=reflection.root_cause or "Unknown",
                 fix=reflection.suggested_fix or "No fix suggested",
                 goal=plan.goal
             )
-        
+
         return reflection
     
     def _extract_error_signature(self, results: TestResults) -> ErrorSignature:
@@ -374,25 +376,3 @@ If nothing non-obvious was learned, return {"learnings": []}."""
             ))
         return learnings
 
-    def _is_hopeless_case(
-        self,
-        test_results: TestResults,
-        iteration: int,
-        error_sig: ErrorSignature
-    ) -> bool:
-        """
-        Heuristic to detect hopeless cases early.
-        """
-        # Too many iterations with same error
-        if iteration > 5 and error_sig.error_type:
-            return True
-        
-        # Syntax errors after iteration 2 are concerning
-        if error_sig.error_type == "SyntaxError" and iteration > 2:
-            return True
-        
-        # Timeout errors might indicate infinite loops
-        if error_sig.error_type == "TimeoutError" and iteration > 3:
-            return True
-        
-        return False

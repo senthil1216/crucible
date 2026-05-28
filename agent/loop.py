@@ -25,6 +25,27 @@ from agent.test_generator import (
 from agent.profiling import StepProfiler
 
 
+def _make_fix_diff(before: Optional[str], after: Optional[str]) -> Optional[str]:
+    """Build a small unified diff between the broken and fixed code blobs.
+
+    Truncates aggressively — the diff is stored on a failure-memory entry
+    purely for human inspection. None inputs return None.
+    """
+    if before is None or after is None:
+        return None
+    import difflib
+    diff = difflib.unified_diff(
+        before.splitlines(),
+        after.splitlines(),
+        fromfile="broken",
+        tofile="fixed",
+        n=2,
+        lineterm="",
+    )
+    text = "\n".join(diff)
+    return text[:2000] if text else None
+
+
 @dataclass
 class CircuitBreaker:
     """
@@ -212,6 +233,11 @@ class ExecutionLoop:
             await install_task
 
         final_state = None
+        # Track the most recently stored failure so that when the next
+        # iteration succeeds we can mark that failure was_fixed=True. The
+        # diff field stores the broken→fixed transition for inspection.
+        last_failure_id: Optional[str] = None
+        last_failure_code: Optional[str] = None
 
         while iteration <= self.config.max_iterations:
             # Check circuit breaker
@@ -273,16 +299,32 @@ class ExecutionLoop:
                 # Check termination conditions
                 if state.status == Status.SUCCESS:
                     print("\n✅ SUCCESS! Tests passed.")
+                    # Mark the prior iteration's failure as fixed so future
+                    # retrievals get a small boost — the failure→fix transition
+                    # is the signal we want the agent to learn from.
+                    failure_memory = getattr(self.reflector, "failure_memory", None)
+                    if last_failure_id and failure_memory:
+                        fix_diff = _make_fix_diff(last_failure_code, state.code.source)
+                        try:
+                            failure_memory.mark_fixed(last_failure_id, fix_diff)
+                        except Exception as e:
+                            print(f"⚠️ mark_fixed failed: {e}")
                     return state
-                
+
                 if not state.reflection.should_continue:
                     print("\n❌ Stopping: Reflector indicates task may be hopeless")
                     return state
-                
+
                 if iteration == self.config.max_iterations:
                     print("\n⚠️ MAX ITERATIONS REACHED")
                     return state
-                
+
+                # Remember this iteration's failure so the next iteration can
+                # mark it fixed if it succeeds.
+                if state.reflection.failure_id:
+                    last_failure_id = state.reflection.failure_id
+                    last_failure_code = state.code.source
+
                 # Prepare for next iteration
                 current_plan = self._prepare_next_plan(state, goal)
                 iteration += 1

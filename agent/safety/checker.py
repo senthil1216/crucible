@@ -158,6 +158,16 @@ class SafetyChecker:
         # For now, be conservative and require approval for all file ops
         # In production, could analyze path arguments
         return False
+
+    # SAFETY CAVEAT: This whole module is best-effort static analysis, not a
+    # security boundary. The AST walker only inspects direct ast.Call nodes,
+    # so the following all bypass it:
+    #   o = open; o(...)             # local rebinding
+    #   import subprocess as s; s.run(...)   # import aliasing
+    #   getattr(__builtins__, "exec")(...)   # dynamic attribute access
+    #   __import__("os").system(...)         # dynamic imports
+    # Treat warnings as advisory. The real isolation boundary is the Docker
+    # executor (see agent/executor/sandbox.py and docker/).
     
     def _pattern_analysis(self, source: str) -> List[str]:
         """Analyze source code for suspicious patterns."""

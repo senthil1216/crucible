@@ -51,6 +51,36 @@ class FailureMemory:
         """Save a single entry to disk."""
         with open(self.failures_file, 'a') as f:
             f.write(json.dumps(entry.to_dict()) + '\n')
+
+    def _rewrite_cache_to_disk(self) -> None:
+        """Rewrite the JSONL file from the current cache. Used for in-place
+        updates to existing entries (e.g. marking was_fixed=True). The cache
+        is the source of truth here."""
+        tmp = self.failures_file.with_suffix(".jsonl.tmp")
+        with open(tmp, 'w') as f:
+            for entry in self._cache:
+                f.write(json.dumps(entry.to_dict()) + '\n')
+        tmp.replace(self.failures_file)
+
+    def mark_fixed(self, failure_id: str, fix_diff: Optional[str] = None) -> bool:
+        """Mark a stored failure as was_fixed=True.
+
+        Called by the loop when iteration N+1 succeeds after iteration N
+        failed: the prior failure was demonstrably fixable, so we boost it
+        in `find_similar_failures` (fixed failures are more useful than raw
+        failures because they carry the implicit lesson that the suggested
+        fix actually worked).
+
+        Returns True if the entry was found and updated.
+        """
+        for entry in self._cache:
+            if entry.id == failure_id:
+                entry.content["was_fixed"] = True
+                if fix_diff is not None:
+                    entry.content["fix_diff"] = fix_diff
+                self._rewrite_cache_to_disk()
+                return True
+        return False
     
     def _extract_error_signature_key(self, sig: ErrorSignature) -> str:
         """Create a key for error matching."""
@@ -120,6 +150,11 @@ class FailureMemory:
 
             entry_emb = self._get_embedding(entry)
             similarity = cosine_similarity(target_emb, entry_emb)
+
+            # Boost fix-confirmed entries: they carry the implicit lesson
+            # that the suggested fix actually worked next iteration.
+            if entry.content.get("was_fixed", False):
+                similarity += 0.05
 
             if similarity > 0.3:  # Threshold
                 scored.append((similarity, entry))
