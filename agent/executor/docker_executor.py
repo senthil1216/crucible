@@ -175,26 +175,36 @@ class DockerExecutor:
         """
         Install Python packages inside the persistent container.
         Restricted interface (no arbitrary shell for now).
+
+        Thin bool wrapper over `install_packages_detailed` — kept for callers
+        that only care whether the install succeeded.
+        """
+        ok, _stdout, stderr = self.install_packages_detailed(packages)
+        if not ok:
+            print(f"[Docker] pip install failed:\n{stderr}")
+        return ok
+
+    def install_packages_detailed(self, packages: list[str]) -> tuple[bool, str, str]:
+        """
+        Install Python packages and return (success, stdout, stderr).
+
+        The detailed return lets DependencyManager categorize *why* an install
+        failed (not_found / build_error / network / permission) instead of
+        collapsing everything to a bool.
         """
         if not self._persistent_container:
             raise RuntimeError("Persistent container is not running. Call start_persistent() first.")
 
         if not packages:
-            return True
+            return True, "", ""
 
         cmd = ["pip", "install", "--no-cache-dir"] + packages
         result = self._persistent_container.exec_run(cmd, demux=True)
 
-        exit_code = result.exit_code
-        stdout, stderr = result.output or (b"", b"")
-
-        if exit_code != 0:
-            # Surface useful error
-            err = (stderr or stdout or b"").decode(errors="replace")
-            print(f"[Docker] pip install failed:\n{err}")
-            return False
-
-        return True
+        stdout_b, stderr_b = result.output or (b"", b"")
+        stdout = (stdout_b or b"").decode(errors="replace")
+        stderr = (stderr_b or b"").decode(errors="replace")
+        return result.exit_code == 0, stdout, stderr
 
     def _run_setup_commands(self) -> None:
         """Run one-time setup inside the persistent container (richer environment).
@@ -407,20 +417,32 @@ class DockerExecutor:
     def install_requirements_file(self, relative_path: str = "requirements.txt") -> bool:
         """
         Install Python packages from a requirements.txt file inside the workspace.
+
+        Thin bool wrapper over `install_requirements_file_detailed`.
+        """
+        ok, _stdout, stderr = self.install_requirements_file_detailed(relative_path)
+        if not ok and stderr:
+            self._log(f"install_requirements_file failed:\n{stderr}", level="error")
+        return ok
+
+    def install_requirements_file_detailed(
+        self, relative_path: str = "requirements.txt"
+    ) -> tuple[bool, str, str]:
+        """
+        Install from a requirements.txt and return (success, stdout, stderr) so
+        the caller can categorize failures.
         """
         if not self.persistent or not self._persistent_container:
-            return False
+            return False, "", "requires a persistent container"
 
         full_path = f"{self._workspace_path}/{relative_path.lstrip('/')}"
         cmd = ["pip", "install", "--no-cache-dir", "-r", full_path]
         result = self._persistent_container.exec_run(cmd, workdir=self._workspace_path, demux=True)
 
-        if result.exit_code != 0:
-            stdout, stderr = result.output or (b"", b"")
-            self._log(f"install_requirements_file failed:\n{stderr.decode(errors='replace')}", level="error")
-            return False
-
-        return True
+        stdout_b, stderr_b = result.output or (b"", b"")
+        stdout = (stdout_b or b"").decode(errors="replace")
+        stderr = (stderr_b or b"").decode(errors="replace")
+        return result.exit_code == 0, stdout, stderr
 
     def run_tests(self, command: str = "python -m pytest") -> tuple[int, str, str]:
         """
