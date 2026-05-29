@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Callable, Optional, List
 
 from agent.executor.docker_executor import DockerExecutor
 
@@ -46,7 +46,9 @@ class InstallResult:
     packages: List[str] = field(default_factory=list)
     stdout: str = ""
     stderr: str = ""
-    failure_reason: Optional[str] = None  # "not_found", "build_error", "network", "unknown"
+    # One of: "not_found", "build_error", "network", "permission", "unknown",
+    # "not_persistent", "user_declined".
+    failure_reason: Optional[str] = None
 
 
 class DependencyManager:
@@ -77,11 +79,22 @@ class DependencyManager:
         "cv": ["opencv-python"],
     }
 
-    def __init__(self, executor: DockerExecutor):
+    def __init__(
+        self,
+        executor: DockerExecutor,
+        ask_before_install: bool = False,
+        confirm_fn: Optional[Callable[[List[str]], bool]] = None,
+    ):
         self.executor = executor
         self._attempt_count: int = 0
         self._max_attempts: int = 4
         self._attempts: List[RecoveryAttempt] = []
+        # Track B: every package successfully installed this task, so the
+        # Reflector / pattern store can persist them (via environment_context).
+        self._installed_packages: List[str] = []
+        # Track B: optional interactive confirmation before any pip install.
+        self.ask_before_install = ask_before_install
+        self._confirm_fn = confirm_fn or self._default_confirm
 
     # ------------------------------------------------------------------
     # Public API
@@ -141,10 +154,12 @@ class DependencyManager:
         """
         Install a list of Python packages using the executor.
 
-        Phase 1 strategy (simple & fast):
+        Strategy (simple & fast):
         - Use common name mappings (Task 2)
         - Try candidates in order until one succeeds
         - Let pip choose the latest compatible version (no pinning)
+        - Categorize the failure (not_found / build_error / network / permission)
+          from pip's stderr so the Reflector can react per-category
         """
         if not packages:
             return InstallResult(success=True)
@@ -157,8 +172,18 @@ class DependencyManager:
                 failure_reason="not_persistent",
             )
 
+        # Track B: optional human-in-the-loop gate before touching the network.
+        if self.ask_before_install and not self._confirm_fn(list(packages)):
+            return InstallResult(
+                success=False,
+                packages=packages,
+                stderr="Install declined by user.",
+                failure_reason="user_declined",
+            )
+
         all_installed: List[str] = []
         last_error = ""
+        last_reason = "unknown"
 
         for pkg in packages:
             candidates = self._resolve_package_candidates(pkg)
@@ -166,19 +191,21 @@ class DependencyManager:
             installed = False
             for candidate in candidates:
                 try:
-                    # Simple & fast: just install the package name.
-                    # pip will pick the latest compatible version by default.
-                    success = self.executor.install_packages([candidate])
-
+                    success, _stdout, stderr = self.executor.install_packages_detailed(
+                        [candidate]
+                    )
                     if success:
                         all_installed.append(candidate)
+                        self._record_installed(candidate)
                         installed = True
                         break
                     else:
-                        last_error = f"Failed to install {candidate}"
+                        last_error = stderr or f"Failed to install {candidate}"
+                        last_reason = self.classify_pip_failure(stderr)
 
                 except Exception as e:
                     last_error = str(e)
+                    last_reason = "unknown"
 
             if not installed:
                 # None of the candidates for this package worked
@@ -186,13 +213,123 @@ class DependencyManager:
                     success=False,
                     packages=all_installed,  # return what we did manage to install
                     stderr=last_error,
-                    failure_reason="install_failed",
+                    failure_reason=last_reason,
                 )
 
         return InstallResult(
             success=True,
             packages=all_installed,
         )
+
+    def install_from_requirements(
+        self, relative_path: str = "requirements.txt"
+    ) -> InstallResult:
+        """
+        Install packages from a generated requirements.txt inside the workspace.
+
+        On-demand by default — the loop decides when to call this (e.g. gated by
+        `AgentConfig.docker_auto_install_requirements`). Failures are categorized
+        the same way as `install_packages`.
+        """
+        if not getattr(self.executor, "persistent", False):
+            return InstallResult(
+                success=False,
+                stderr="install_from_requirements() requires a persistent container.",
+                failure_reason="not_persistent",
+            )
+
+        if self.ask_before_install and not self._confirm_fn([f"-r {relative_path}"]):
+            return InstallResult(
+                success=False,
+                stderr="Install declined by user.",
+                failure_reason="user_declined",
+            )
+
+        try:
+            success, stdout, stderr = self.executor.install_requirements_file_detailed(
+                relative_path
+            )
+        except Exception as e:
+            return InstallResult(success=False, stderr=str(e), failure_reason="unknown")
+
+        if not success:
+            return InstallResult(
+                success=False,
+                stdout=stdout,
+                stderr=stderr,
+                failure_reason=self.classify_pip_failure(stderr),
+            )
+        return InstallResult(success=True, stdout=stdout)
+
+    # ------------------------------------------------------------------
+    # Failure categorization (Track B)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def classify_pip_failure(stderr: str) -> str:
+        """Map pip's stderr to a coarse failure category.
+
+        Returns one of: "permission", "not_found", "network", "build_error",
+        "unknown". Order matters — the most specific / least ambiguous signals
+        are checked first so a not_found error that happens to retry over the
+        network isn't misread as a transient network failure.
+        """
+        if not stderr:
+            return "unknown"
+        text = stderr.lower()
+
+        if "permission denied" in text or "errno 13" in text or "eacces" in text:
+            return "permission"
+        if (
+            "no matching distribution found" in text
+            or "could not find a version that satisfies" in text
+        ):
+            return "not_found"
+        if (
+            "temporary failure in name resolution" in text
+            or "could not fetch url" in text
+            or "connection refused" in text
+            or "network is unreachable" in text
+            or "failed to establish a new connection" in text
+            or "timed out" in text
+            or "retrying" in text
+        ):
+            return "network"
+        if (
+            "failed building wheel" in text
+            or "subprocess-exited-with-error" in text
+            or "microsoft visual c++" in text
+            or "legacy-install-failure" in text
+            or re.search(r"command '[^']+' failed", text)
+            or "gcc" in text
+            or "clang" in text
+        ):
+            return "build_error"
+        return "unknown"
+
+    # ------------------------------------------------------------------
+    # Install confirmation + tracking (Track B)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _default_confirm(packages: List[str]) -> bool:
+        """Interactive prompt used when ask_before_install is on and no custom
+        confirm_fn was supplied. Defaults to 'no' on EOF/non-interactive."""
+        try:
+            answer = input(f"Install {', '.join(packages)}? [y/N] ").strip().lower()
+        except EOFError:
+            return False
+        return answer in ("y", "yes")
+
+    def _record_installed(self, candidate: str) -> None:
+        if candidate and candidate not in self._installed_packages:
+            self._installed_packages.append(candidate)
+
+    @property
+    def installed_packages(self) -> List[str]:
+        """Packages successfully installed during the current task (cumulative
+        until reset). Fed into the Pattern's environment_context on success."""
+        return list(self._installed_packages)
 
     def _resolve_package_candidates(self, package: str) -> List[str]:
         """
@@ -295,6 +432,7 @@ class DependencyManager:
         """Reset attempt tracking for a new task."""
         self._attempt_count = 0
         self._attempts = []
+        self._installed_packages = []
 
     @property
     def attempts_remaining(self) -> int:
