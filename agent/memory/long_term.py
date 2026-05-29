@@ -250,37 +250,49 @@ class LongTermMemory:
             entry_emb = self._get_embedding(entry)
             base = cosine_similarity(query_emb, entry_emb)
 
-            score = base
+            # Track each component separately so callers (e.g. the benchmark
+            # runner) can log *why* an entry ranked where it did, not just the
+            # final score. components sum exactly to `score`.
+            pt_bonus = 0.0
+            deps_bonus = 0.0
+            pkg_bonus = 0.0
             if project_type and entry_project_type == project_type:
-                score += self._PROJECT_TYPE_BONUS
+                pt_bonus = self._PROJECT_TYPE_BONUS
             if dep_filter and stored_deps:
                 overlap = len(stored_deps & dep_filter)
                 # Bonus scales with overlap fraction of the query's dependency
                 # list, capped at _DEPENDENCY_BONUS_MAX.
-                bonus = min(
+                deps_bonus = min(
                     self._DEPENDENCY_BONUS_MAX,
                     self._DEPENDENCY_BONUS_MAX * (overlap / max(len(dep_filter), 1)),
                 )
-                score += bonus
             if pkg_filter and stored_pkgs:
                 overlap = len(stored_pkgs & pkg_filter)
-                bonus = min(
+                pkg_bonus = min(
                     self._ENV_PACKAGE_BONUS_MAX,
                     self._ENV_PACKAGE_BONUS_MAX * (overlap / max(len(pkg_filter), 1)),
                 )
-                score += bonus
+
+            score = base + pt_bonus + deps_bonus + pkg_bonus
 
             if score >= min_similarity:
-                scored.append((score, base, entry))
+                breakdown = {
+                    "semantic": base,
+                    "project_type_bonus": pt_bonus,
+                    "deps_bonus": deps_bonus,
+                    "package_bonus": pkg_bonus,
+                }
+                scored.append((score, base, breakdown, entry))
 
         scored.sort(reverse=True, key=lambda x: x[0])
 
         results: List[Dict[str, Any]] = []
-        for score, base, entry in scored[:k]:
+        for score, base, breakdown, entry in scored[:k]:
             results.append({
                 "id": entry.id,
                 "similarity": score,             # multi-signal score
                 "base_similarity": base,         # raw semantic cosine
+                "score_breakdown": breakdown,    # per-component contributions
                 "goal": entry.content["goal"],
                 "plan": entry.content["plan"],
                 "code": entry.content["code"],

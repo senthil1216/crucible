@@ -84,10 +84,9 @@ The runner is merged; what's left is to actually run it and write the
 1-pager. Cheap, and it shakes out the harness before the bigger Track D
 benchmark generalizes the same runner.
 
-- **Score-breakdown logging** (the runner's standing TODO): hook
-  `LongTermMemory.find_similar_solutions` / the Planner to capture the
-  component scores (semantic / project_type / deps / installed-package) per
-  retrieval, not just which Patterns/Learnings came back.
+- ~~**Score-breakdown logging**~~ — done. `find_similar_solutions` now returns a
+  `score_breakdown` (semantic / project_type / deps / installed-package) per result;
+  `bench/track_c_runner.py` logs it per retrieved pattern.
 - **Run + report**: run the 8-task CSV batch on the 3.12 venv with
   `--docker-persistent --docker-image crucible-runtime`; write
   `docs/track-c-report.md` (per-task iterations-to-success, whether
@@ -109,6 +108,13 @@ conditional predictions stay deferred.
 
 Generalize `bench/track_c_runner.py` into `bench/runner.py` and run enough
 tasks to accumulate replay verdicts.
+
+> **Status: harness code-complete; run pending.** `bench/runner.py` (memory
+> persisted across the whole batch, `--reps` / `--smoke` / `--docker-image` flags,
+> per-run JSONL incl. `replay_report`) and `bench/problems.py` (40 deterministic
+> single-function problems across string/list/dict/math/parsing) now exist with
+> unit tests. What remains is executing them on a capable machine (3.12 venv +
+> `crucible-runtime` image + Ollama) — see the pre-reqs below.
 
 - **Problem set** — 30–50 *deterministic* small Python problems
   (`bench/problems.py`). Hard requirements, learned from earlier runs:
@@ -147,6 +153,12 @@ tasks to accumulate replay verdicts.
 #### Phase 4 — Calibration + writeup
 
 Turn the JSONL into `bench/REPORT.md` with real numbers.
+
+> **Status: analysis code-complete; awaiting real data.** `bench/analyze.py`
+> computes all the metrics below (calibration-by-confidence-bucket, off-topic rate,
+> convergence variance, memory-helped, surviving-predictions catalog, retirement
+> stats) and renders `bench/REPORT.md`. A synthetic placeholder `bench/REPORT.md`
+> is committed to show the layout; real numbers land after the phase-3 run.
 
 - **Calibration is aggregate-by-confidence, not per-prediction.** Important
   design constraint: `failure_id = sha256(normalize(error) : code[:100])` is
