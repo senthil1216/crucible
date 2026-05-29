@@ -101,7 +101,12 @@ class SelfImprovingAgent:
             )
 
             # Create DependencyManager for automatic recovery
-            self.dependency_manager = DependencyManager(executor=self.sandbox)
+            self.dependency_manager = DependencyManager(
+                executor=self.sandbox,
+                ask_before_install=getattr(
+                    self.config, "docker_ask_before_install", False
+                ),
+            )
         else:
             self.sandbox = SandboxedExecutor(
                 config=exec_config,
@@ -426,6 +431,17 @@ class SelfImprovingAgent:
                     env_ctx = self.sandbox.capture_environment() or {}
                 except Exception as e:
                     print(f"⚠️  capture_environment failed (non-fatal): {e}")
+
+            # Track B: fold in packages the DependencyManager installed this
+            # task, so agent-driven installs are persisted on the Pattern even
+            # if the pip-freeze snapshot missed them. Union, lowercased, deduped.
+            if self.dependency_manager:
+                installed = self.dependency_manager.installed_packages
+                if installed:
+                    existing = env_ctx.get("installed_packages") or []
+                    merged = {p.lower() for p in existing}
+                    merged.update(p.lower() for p in installed)
+                    env_ctx["installed_packages"] = sorted(merged)
 
             await self.long_term_memory.store_pattern(
                 goal=goal,

@@ -476,6 +476,13 @@ class AgentConfig:
     docker_enable_network: bool = True       # Needed for pip install etc. in persistent mode
     docker_install_build_tools: bool = True  # Install build-essential etc. on persistent start
 
+    # Track B: dependency-recovery controls.
+    # Pause for confirmation before any automatic pip install (interactive only).
+    docker_ask_before_install: bool = False
+    # Run `pip install -r requirements.txt` automatically when the agent
+    # generates one. Off by default — recovery stays on-demand / import-driven.
+    docker_auto_install_requirements: bool = False
+
     # Run-the-app: after a server task passes its tests, launch it and leave it
     # running, reachable from the host. Requires docker_persistent.
     run_app: bool = False

@@ -57,26 +57,25 @@ Merged work (no further action needed):
 
 ## What's open
 
-### Track B — DependencyManager hardening
+### Track B — DependencyManager hardening — done
 
 Pending tasks from the original `phase1-dependency-recovery-design.md`.
-Opportunistic — don't block Track D on these.
+All four shipped (code-only, fully unit-tested in `tests/test_dependency_manager.py`):
 
-- **`requirements.txt` support** in `DependencyManager`. The
-  `DockerExecutor` already has `install_requirements_file`; expose it via
-  `DependencyManager.install_from_requirements(path)` and decide a
-  policy (always run on generated `requirements.txt`? on demand only?).
-- **Categorize install failure types**. `InstallResult.failure_reason`
-  exists but is only set to `"not_persistent"` or `"install_failed"`.
-  Parse pip output and classify into `not_found` / `build_error` /
-  `network` / `permission` so the Reflector can act differently per
-  category.
-- **Optional install confirmation**. Add `docker_ask_before_install: bool`
-  to `AgentConfig`; pause before `pip install` in interactive mode. UX
-  only; lowest priority.
-- **Persist successful installations to long-term memory** via the Phase D
-  `environment_context` already stored on Patterns; don't add a separate
-  store.
+- ~~**`requirements.txt` support**~~ — `DependencyManager.install_from_requirements(path)`
+  delegates to `DockerExecutor.install_requirements_file_detailed`; gated by the
+  new `AgentConfig.docker_auto_install_requirements` flag (default off → recovery
+  stays on-demand / import-driven).
+- ~~**Categorize install failure types**~~ — `DependencyManager.classify_pip_failure`
+  parses pip stderr into `not_found` / `build_error` / `network` / `permission` /
+  `unknown`; `install_packages` now threads stderr via
+  `DockerExecutor.install_packages_detailed` and sets `failure_reason` accordingly.
+- ~~**Optional install confirmation**~~ — `AgentConfig.docker_ask_before_install`
+  wires an injectable confirm callback on `DependencyManager`; declining returns
+  `failure_reason="user_declined"` without touching the network. Default off.
+- ~~**Persist successful installations**~~ — `DependencyManager.installed_packages`
+  (cumulative per task) is unioned into the Pattern's `environment_context.installed_packages`
+  on success in `core.py`. No separate store.
 
 ### Track C — close out the memory demo
 
@@ -208,10 +207,13 @@ Turn the JSONL into `bench/REPORT.md` with real numbers.
 
 1. ~~**Track A**~~ — done (`v0.1.0`).
 2. ~~**Track D phases 1–2**~~ — done (predictions + replay engine).
-3. **Track C close-out** — small; run the demo + write the 1-pager, fixing
-   any harness bugs that would also bite Phase 3.
-4. **Track D phase 3 (benchmark)** — the long pole. Build `bench/runner.py`
-   on the Track C runner, smoke-run, then the full 40×5.
-5. **Track D phase 4 (calibration + writeup)** — the publishable artifact.
-6. **Track B** — opportunistic; pick off items as the benchmark exposes
-   dependency-recovery gaps.
+3. ~~**Track D phase 3–4 harness**~~ — done (code). `bench/runner.py`,
+   `bench/problems.py`, `bench/analyze.py` built + score-breakdown logging
+   (PR #16). Execution still pending a capable machine.
+4. ~~**Track B**~~ — done. DependencyManager hardening (all four items).
+5. **Track D phase 3 RUN** — execute the benchmark on a 3.12 venv +
+   `crucible-runtime` image + Ollama: smoke-run, then the full 40×5.
+6. **Track D phase 4 RUN** — `python -m bench.analyze` the JSONL into
+   `bench/REPORT.md` with real numbers; draft the writeup.
+7. **Track C close-out** — run the 8-task CSV demo + write the 1-pager
+   (also needs a capable machine).
