@@ -213,6 +213,52 @@ class TestLongTermMemory:
         assert ranked[1]["similarity"] == ranked[1]["base_similarity"]
 
     @pytest.mark.asyncio
+    async def test_score_breakdown_components_reconcile(self, temp_dir, fake_embeddings):
+        """Each result carries a score_breakdown whose components sum to similarity,
+        and bonuses appear only when the corresponding signal is passed."""
+        memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
+
+        plan = Plan(
+            goal="serve an endpoint",
+            steps=[], test_cases=[], language="python",
+            project_type="fastapi",
+            dependencies=["fastapi", "uvicorn"],
+        )
+        code = CodeArtifact(source="x = 1", file_path="x.py", language="python")
+        await memory.store_pattern(
+            "serve an endpoint", plan, code,
+            environment_context={"installed_packages": ["fastapi", "uvicorn"]},
+        )
+
+        # No structured signals → only the semantic component contributes.
+        plain = await memory.find_similar_solutions(
+            "serve an endpoint", k=1, min_similarity=0.0
+        )
+        bd = plain[0]["score_breakdown"]
+        assert bd["project_type_bonus"] == 0.0
+        assert bd["deps_bonus"] == 0.0
+        assert bd["package_bonus"] == 0.0
+        assert bd["semantic"] == pytest.approx(plain[0]["base_similarity"])
+        assert plain[0]["similarity"] == pytest.approx(bd["semantic"])
+
+        # All three signals → all three bonuses fire and components reconcile.
+        full = await memory.find_similar_solutions(
+            "serve an endpoint", k=1, min_similarity=0.0,
+            project_type="fastapi",
+            dependencies=["fastapi"],
+            installed_packages=["fastapi", "uvicorn"],
+        )
+        bd = full[0]["score_breakdown"]
+        assert bd["project_type_bonus"] > 0.0
+        assert bd["deps_bonus"] > 0.0
+        assert bd["package_bonus"] > 0.0
+        total = (
+            bd["semantic"] + bd["project_type_bonus"]
+            + bd["deps_bonus"] + bd["package_bonus"]
+        )
+        assert full[0]["similarity"] == pytest.approx(total)
+
+    @pytest.mark.asyncio
     async def test_dependency_overlap_boost_ranks_matching_first(self, temp_dir, fake_embeddings):
         memory = LongTermMemory(temp_dir, embedding_client=fake_embeddings)
 

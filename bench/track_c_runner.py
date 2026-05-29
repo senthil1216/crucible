@@ -118,6 +118,7 @@ async def run_one(
             {
                 "id": p.get("id"),
                 "similarity": p.get("similarity"),
+                "score_breakdown": p.get("score_breakdown"),
                 "project_type": p.get("project_type"),
                 "source_goal": p.get("goal") or p.get("source_goal"),
             }
