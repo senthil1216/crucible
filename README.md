@@ -59,7 +59,8 @@ python -m agent "Create a REST API" --llm openai --model gpt-4
 ### Option 3: Persistent Docker workspace (multi-file projects)
 
 ```bash
-pip install docker
+pip install -r requirements.txt   # includes sentence-transformers for memory
+pip install docker                # only needed for --docker
 
 python -m agent "Build a FastAPI app with /health and /items endpoints" \
   --llm ollama --docker --docker-persistent
