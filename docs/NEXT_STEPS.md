@@ -105,18 +105,12 @@ Sketched weekends:
    `Reflector.SYSTEM_PROMPT` to emit a prediction field on failed
    iterations, strict schema gate (drop predictions without a concrete
    `trigger_input`), store in `agent/memory/predictions.jsonl`.
-2. ~~**Replay engine**~~ — **done** (`agent/replay.py`, PR TBD). On task
-   success, every prediction linked to that task's failures
-   (`find_by_failure_id`) is replayed against the final passing code: a
-   deterministic driver is appended to the solution, `trigger_input` is
-   `ast.literal_eval`'d and fed to the selected public entry point in the
-   sandbox, and the outcome is classified **Confirmed** / **Falsified** /
-   **Off-topic** (off-topic = couldn't apply the input; never counted).
-   Verdicts write back via `PredictionMemory.record_replays`; auto-retire
-   at `times_tested ≥ 10 AND confirmation_rate < 0.30`. **Record-only** —
-   the `predictions_gate_enabled` hook exists but is inert; blocking a
-   success on a confirmed latent bug is deferred until the phase-4
-   calibration data justifies trusting predictions enough to act on them.
+2. **Replay engine** — given a `Prediction` and a `CodeArtifact`,
+   generate a test wrapper that invokes the code with `trigger_input`,
+   run through the sandbox, classify as **Confirmed** / **Falsified** /
+   **Off-topic**. Wire as a post-test pre-success gate. Scoring +
+   pruning: predictions tested >10 times with <30% confirmation rate
+   get retired. Reuse the embedding utility for the scoping gate.
 3. **Benchmark** — curate 30–50 deterministic small coding problems.
    Build `bench/runner.py` (N=5 default per problem). Smoke run first.
 4. **Analysis + writeup** — full run with persisted predictions +
