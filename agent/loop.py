@@ -23,6 +23,7 @@ from agent.test_generator import (
     TestGenerator, static_check_test_code, build_stub_files, MODULE_NAME,
 )
 from agent.profiling import StepProfiler
+from agent.replay import ReplayEngine
 
 
 def _make_fix_diff(before: Optional[str], after: Optional[str]) -> Optional[str]:
@@ -133,6 +134,7 @@ class ExecutionLoop:
         dependency_manager: Optional[DependencyManager] = None,          # Phase 2
         test_generator: Optional[TestGenerator] = None,                  # real-pytest gate
         profiler: Optional[StepProfiler] = None,                         # per-step timing
+        replay_engine: Optional["ReplayEngine"] = None,                  # Track D phase 2
     ):
         self.planner = planner
         self.code_generator = code_generator
@@ -142,6 +144,9 @@ class ExecutionLoop:
         self.config = config or LoopConfig()
         self.install_packages = install_packages
         self.dependency_manager = dependency_manager  # Preferred Phase 2 path
+        # Track D phase 2: replays this task's failure predictions against the
+        # passing code on success (record-only). None disables replay.
+        self.replay_engine = replay_engine
         # When set, single-file Python tasks are gated on a real, frozen pytest
         # suite instead of "the script exited 0". When None, the legacy
         # exit-code behavior is preserved (used by the loop's own unit tests).
@@ -238,6 +243,10 @@ class ExecutionLoop:
         # diff field stores the broken→fixed transition for inspection.
         last_failure_id: Optional[str] = None
         last_failure_code: Optional[str] = None
+        # Track D phase 2: every failure-memory id emitted during this task, so
+        # that on success we can replay all of their predictions against the
+        # final code. Reset per run() — this loop instance is reused across tasks.
+        emitted_failure_ids: List[str] = []
 
         while iteration <= self.config.max_iterations:
             # Check circuit breaker
@@ -309,6 +318,14 @@ class ExecutionLoop:
                             failure_memory.mark_fixed(last_failure_id, fix_diff)
                         except Exception as e:
                             print(f"⚠️ mark_fixed failed: {e}")
+                    # Track D phase 2: replay this task's failure predictions
+                    # against the passing code (record-only — never changes the
+                    # SUCCESS result). Scoped to the single-file Python pytest
+                    # path: the replay driver assumes the `solution` module
+                    # contract, like _pytest_gate_enabled.
+                    await self._maybe_replay_predictions(
+                        state, current_plan, emitted_failure_ids, goal
+                    )
                     return state
 
                 if not state.reflection.should_continue:
@@ -324,6 +341,7 @@ class ExecutionLoop:
                 if state.reflection.failure_id:
                     last_failure_id = state.reflection.failure_id
                     last_failure_code = state.code.source
+                    emitted_failure_ids.append(state.reflection.failure_id)
 
                 # Prepare for next iteration
                 current_plan = self._prepare_next_plan(state, goal)
@@ -365,6 +383,33 @@ class ExecutionLoop:
         parts.append(test_results.stderr or "")
         parts.append(test_results.stdout or "")
         return "\n".join(p for p in parts if p)
+
+    async def _maybe_replay_predictions(
+        self,
+        state: IterationState,
+        plan: Plan,
+        failure_ids: List[str],
+        goal: str,
+    ) -> None:
+        """Replay this task's failure predictions against the passing code and
+        attach the report to `state.replay_report`. Best-effort and record-only:
+        any error here is logged and swallowed — it must never turn a SUCCESS
+        into a failure (that's the inert `predictions_gate_enabled` hook's job in
+        a future phase, not phase 2)."""
+        if not self.replay_engine or not failure_ids:
+            return
+        # Same `solution`-module contract the replay driver depends on.
+        if not self._pytest_gate_enabled(plan):
+            return
+        try:
+            with self.profiler.track("replay"):
+                report = await self.replay_engine.replay_for_failures(
+                    failure_ids, state.code.source, goal=goal
+                )
+            state.replay_report = report.to_dict()
+            print(report.summary_line())
+        except Exception as e:
+            print(f"⚠️ Prediction replay failed (non-fatal): {e}")
 
     async def _eager_install(self, plan: Plan) -> None:
         """Install the plan's declared pip dependencies once, up front.

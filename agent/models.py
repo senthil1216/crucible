@@ -358,6 +358,11 @@ class IterationState:
     # Frozen pytest suite for this task. Generated once (test-first) and reused
     # unchanged across fix iterations so the agent fixes code, never the tests.
     test_code: Optional[CodeArtifact] = None
+    # Track D phase 2: summary of replaying this task's failure predictions
+    # against the final passing code (ReplayReport.to_dict()). Present only on a
+    # successful state when the replay engine ran; None otherwise. Record-only —
+    # it does not affect `status`.
+    replay_report: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -370,6 +375,7 @@ class IterationState:
             "timestamp": self.timestamp.isoformat(),
             "task_id": self.task_id,
             "test_code": self.test_code.to_dict() if self.test_code else None,
+            "replay_report": self.replay_report,
         }
 
     @classmethod
@@ -385,6 +391,7 @@ class IterationState:
             timestamp=datetime.fromisoformat(data["timestamp"]),
             task_id=data.get("task_id"),
             test_code=CodeArtifact(**test_code_data) if test_code_data else None,
+            replay_report=data.get("replay_report"),
         )
 
 
@@ -431,6 +438,14 @@ class LoopConfig:
     # (structurally invalid, or vacuous against a stub) before giving up /
     # proceeding with a warning.
     max_test_regenerations: int = 2
+
+    # Track D phase 2: replay each failure's predictions against the passing
+    # code on success. INERT HOOK — in phase 2 the replay engine is strictly
+    # record-only (it gathers calibration data; see agent/replay.py). This flag
+    # exists so a future phase can make a Confirmed latent bug re-enter the loop
+    # *after* the phase-4 calibration data justifies trusting predictions enough
+    # to act on. Leave False until then.
+    predictions_gate_enabled: bool = False
     
     # Circuit breaker settings
     failure_threshold: int = 3

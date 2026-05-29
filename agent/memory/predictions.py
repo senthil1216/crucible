@@ -39,6 +39,16 @@ class PredictionMemory:
     # produces confirmation data.
     _CONFIRMATION_BONUS_MAX = 0.10
 
+    # Pruning policy (Track D phase 2). A prediction that has been replayed
+    # enough times and almost never reproduced its predicted error is noise:
+    # retire it so it stops being surfaced to the Planner and stops being
+    # re-tested. We mark `retired=True` rather than delete the row — the
+    # calibration analysis (phase 4) still wants the full history. Retirement
+    # uses the RAW confirmation rate (not the Laplace-smoothed one) because the
+    # threshold is about observed behaviour over a real sample, not ranking.
+    _RETIRE_MIN_TESTS = 10
+    _RETIRE_MAX_RATE = 0.30
+
     def __init__(
         self,
         storage_path: Path,
@@ -147,6 +157,10 @@ class PredictionMemory:
 
         scored: List[tuple] = []
         for entry in self._cache:
+            # Retired predictions have been replayed enough to know they don't
+            # hold up — don't surface them to the Planner.
+            if entry.content.get("retired"):
+                continue
             entry_emb = self._get_goal_embedding(entry)
             if not entry_emb:
                 continue
@@ -180,17 +194,27 @@ class PredictionMemory:
             })
         return results
 
-    def find_by_failure_id(self, failure_id: str) -> List[Dict[str, Any]]:
+    def find_by_failure_id(
+        self, failure_id: str, include_retired: bool = False
+    ) -> List[Dict[str, Any]]:
         """All predictions linked to a given failure. Used by phase 2's
         replay engine to fetch the falsifiable claims associated with a
-        prior failure when new candidate code lands."""
+        prior failure when new candidate code lands.
+
+        Retired predictions are excluded by default — once a prediction has
+        been disproven enough times to retire, there is no point spending
+        sandbox time replaying it again. Pass include_retired=True for
+        diagnostics."""
         results: List[Dict[str, Any]] = []
         for entry in self._cache:
-            if entry.content.get("source_failure_id") == failure_id:
-                results.append({
-                    "id": entry.id,
-                    **entry.content,
-                })
+            if entry.content.get("source_failure_id") != failure_id:
+                continue
+            if entry.content.get("retired") and not include_retired:
+                continue
+            results.append({
+                "id": entry.id,
+                **entry.content,
+            })
         return results
 
     def all_predictions(self) -> List[Dict[str, Any]]:
@@ -198,10 +222,55 @@ class PredictionMemory:
         from hot paths — it's a full scan."""
         return [{"id": e.id, **e.content} for e in self._cache]
 
+    def _maybe_retire(self, entry: MemoryEntry) -> bool:
+        """Mark an entry retired if it has been replayed enough times and its
+        observed confirmation rate is below the floor. Returns True if it
+        just transitioned to retired."""
+        if entry.content.get("retired"):
+            return False
+        tested = int(entry.content.get("times_tested", 0) or 0)
+        confirmed = int(entry.content.get("times_confirmed", 0) or 0)
+        if tested >= self._RETIRE_MIN_TESTS and (confirmed / tested) < self._RETIRE_MAX_RATE:
+            entry.content["retired"] = True
+            return True
+        return False
+
+    def record_replays(self, outcomes: Dict[str, bool]) -> int:
+        """Record a batch of replay results in a single disk rewrite.
+
+        `outcomes` maps prediction id → confirmed?. Every id present is counted
+        as one more test (times_tested += 1); ids mapped to True also bump
+        times_confirmed. Auto-retirement is evaluated after the bump. This is
+        the path the phase-2 ReplayEngine uses — preferred over calling
+        record_tested / record_confirmed separately (one rewrite, atomic
+        retirement check)."""
+        if not outcomes:
+            return 0
+        updated = 0
+        retired = 0
+        for entry in self._cache:
+            if entry.id not in outcomes:
+                continue
+            entry.content["times_tested"] = int(
+                entry.content.get("times_tested", 0) or 0
+            ) + 1
+            if outcomes[entry.id]:
+                entry.content["times_confirmed"] = int(
+                    entry.content.get("times_confirmed", 0) or 0
+                ) + 1
+            if self._maybe_retire(entry):
+                retired += 1
+            updated += 1
+        if updated:
+            self._rewrite_cache_to_disk()
+        if retired:
+            print(f"[predictions] retired {retired} low-confirmation prediction(s)")
+        return updated
+
     def record_tested(self, prediction_ids: List[str]) -> int:
         """Bump times_tested. Called by the phase-2 replay engine after a
         prediction is exercised against new candidate code, regardless of
-        outcome."""
+        outcome. Prefer `record_replays` for the common tested+confirmed case."""
         if not prediction_ids:
             return 0
         wanted = set(prediction_ids)
@@ -211,6 +280,7 @@ class PredictionMemory:
                 entry.content["times_tested"] = int(
                     entry.content.get("times_tested", 0) or 0
                 ) + 1
+                self._maybe_retire(entry)
                 updated += 1
         if updated:
             self._rewrite_cache_to_disk()
@@ -228,12 +298,13 @@ class PredictionMemory:
                 entry.content["times_confirmed"] = int(
                     entry.content.get("times_confirmed", 0) or 0
                 ) + 1
+                self._maybe_retire(entry)
                 updated += 1
         if updated:
             self._rewrite_cache_to_disk()
         return updated
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self) -> Dict[str, Any]:
         total = len(self._cache)
         tested = sum(
             1 for e in self._cache
@@ -243,8 +314,23 @@ class PredictionMemory:
             1 for e in self._cache
             if int(e.content.get("times_confirmed", 0) or 0) > 0
         )
+        retired = sum(1 for e in self._cache if e.content.get("retired"))
+        total_tests = sum(
+            int(e.content.get("times_tested", 0) or 0) for e in self._cache
+        )
+        total_confirmations = sum(
+            int(e.content.get("times_confirmed", 0) or 0) for e in self._cache
+        )
         return {
             "total_predictions": total,
             "tested": tested,
             "confirmed_at_least_once": confirmed,
+            "retired": retired,
+            "total_tests": total_tests,
+            "total_confirmations": total_confirmations,
+            # Aggregate (uncalibrated) confirmation rate across every replay —
+            # the headline number the phase-4 calibration analysis builds on.
+            "overall_confirmation_rate": (
+                total_confirmations / total_tests if total_tests else None
+            ),
         }

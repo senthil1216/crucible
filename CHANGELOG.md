@@ -4,6 +4,37 @@ All notable changes to Crucible. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Track D phase 2 — prediction replay engine** (`agent/replay.py`). On task
+  success, every falsifiable prediction emitted during that task's failed
+  iterations is replayed against the final passing code and classified
+  **Confirmed** / **Falsified** / **Off-topic**:
+  - A deterministic driver is appended to the solution source and run via the
+    existing `executor.execute()` (works on the subprocess sandbox and Docker).
+    It `ast.literal_eval`s the `trigger_input`, invokes the selected public
+    entry point, and emits a single `__CRUCIBLE_REPLAY__` sentinel JSON line.
+  - "Inside the solution" vs "at the call boundary" is decided by traceback
+    line numbers, so an arity/invocation error is classified Off-topic (never
+    counted) rather than a false Confirmed.
+  - Entry-point selection is conservative: single public function, else a
+    unique goal-token match, else Off-topic with a recorded reason.
+- `PredictionMemory.record_replays(outcomes)` — single-rewrite batch counter
+  update; `retired` flag with auto-retirement at `times_tested ≥ 10 AND
+  confirmation_rate < 0.30`; retired predictions are excluded from
+  `find_relevant` (Planner surfacing) and `find_by_failure_id` (replay).
+  `get_stats` now reports `retired`, `total_tests`, `total_confirmations`, and
+  the aggregate `overall_confirmation_rate`.
+- `IterationState.replay_report` — per-task replay summary, persisted for the
+  phase-3/4 calibration analysis.
+- `LoopConfig.predictions_gate_enabled` (default False) — **inert** hook for a
+  future phase that could re-loop on a confirmed latent bug. Phase 2 is
+  strictly record-only; replay never changes a task's result.
+- `tests/test_replay.py` — entry-point selection, sentinel parsing,
+  classification, engine routing + write-back (fake executor), retirement, and
+  end-to-end confirmed/falsified/off-topic against the real sandbox.
+
 ## [0.1.0] - 2026-05-28
 
 First tagged release. Closes Track A of `docs/NEXT_STEPS.md` — a set of

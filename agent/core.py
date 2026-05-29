@@ -119,6 +119,17 @@ class SelfImprovingAgent:
             prediction_memory=self.prediction_memory,
         )
 
+        # Track D phase 2: replay engine closes the prediction loop. Only built
+        # when predictions are enabled; runs the trigger inputs through the same
+        # execution backend the tester uses. Record-only.
+        self.replay_engine = None
+        if self.prediction_memory is not None:
+            from agent.replay import ReplayEngine
+            self.replay_engine = ReplayEngine(
+                executor=self.sandbox,
+                prediction_memory=self.prediction_memory,
+            )
+
         # State persistence
         self.state_manager = StateManager(self.config.state_path)
 
@@ -139,6 +150,7 @@ class SelfImprovingAgent:
             dependency_manager=self.dependency_manager,      # Phase 2 preferred path
             test_generator=self.test_generator,              # real-pytest gate
             profiler=self.profiler,                          # per-step timing
+            replay_engine=self.replay_engine,                # Track D phase 2
         )
 
     def ensure_packages(self, packages: list[str]) -> bool:
