@@ -1,9 +1,7 @@
 # Next Steps
 
-Single source of truth for what's left to do on Crucible. Supersedes the prior
-`NEXT_STEPS.md` plus the three phase design docs (long-term-memory,
-phase1-dependency-recovery, phase2-workspace) — anything completed has been
-removed; anything still open lives here.
+Single source of truth for what's left to do on Crucible. Anything completed
+has been moved to "Where we are"; anything still open lives under "What's open".
 
 ## Where we are
 
@@ -31,22 +29,38 @@ Merged work (no further action needed):
 - **DependencyManager (partial)** — automatic `ModuleNotFoundError`
   recovery, regex-based extraction, import-name→PyPI mapping, max-4
   attempts. (PR #2/#3)
-- **README rewrite** — honest framing, accurate project structure,
-  documented Docker/multi-file modes. (PR #6)
-- **Track A — v0.1.0 cleanup** — `ErrorSignature.normalize` tightened to
-  preserve identifier signal; `was_fixed` wired end-to-end via
-  `Reflection.failure_id` + `FailureMemory.mark_fixed` (broken→fixed diff
-  stored, +0.05 retrieval boost); async subprocess in `_execute_python`,
-  `_execute_javascript`, and `validate_syntax`; dead `_is_hopeless_case`
-  removed; SECURITY notes added to `sandbox.py` and `safety/checker.py`;
-  `CHANGELOG.md` introduced. (PR TBD — v0.1.0)
+- **Real-pytest success gate + tooling** — test-first frozen pytest suite,
+  `StepProfiler`, xAI provider, `--run` app launch, prebaked Docker runtime
+  image (`docker/Dockerfile` → `crucible-runtime`). (PR #8)
+- **Track A — v0.1.0** — `ErrorSignature.normalize` tightened; `was_fixed`
+  wired end-to-end (`Reflection.failure_id` + `FailureMemory.mark_fixed`,
+  broken→fixed diff, +0.05 retrieval boost); async subprocess execution;
+  `CHANGELOG.md` introduced; SECURITY notes on the sandbox. (PR #9, tagged
+  `v0.1.0`)
+- **Track C scaffold** — `bench/track_c_runner.py` + an 8-task CSV batch
+  (`bench/track_c_tasks.py`); learning-feedback loop tracking helpfulness
+  across tasks. (PR #10, #11)
+- **Track D phase 1 — predictions** — `Prediction` dataclass, Reflector
+  emission on failure (strict schema gate: concrete `trigger_input` + a
+  Python exception type), `PredictionMemory` (`predictions.jsonl`), semantic
+  `find_relevant`, Planner surfacing of past failure modes. (PR #12, #13)
+- **Track D phase 2 — replay engine** — `agent/replay.py`. On success,
+  every prediction linked to that task's failures is replayed against the
+  final passing code and classified Confirmed / Falsified / Off-topic;
+  verdicts write back via `PredictionMemory.record_replays`; auto-retire at
+  `times_tested ≥ 10 AND confirmation_rate < 0.30`. Record-only
+  (`predictions_gate_enabled` hook is inert). `IterationState.replay_report`
+  persists per-task verdicts. (PR #14)
+- **Graceful embedding degradation** — `EmbeddingClient.encode()` returns
+  `[]` instead of raising when `sentence-transformers` is absent; memory
+  falls back to structured filters. (PR #14)
 
 ## What's open
 
 ### Track B — DependencyManager hardening
 
-Pending tasks from the original `phase1-dependency-recovery-design.md`
-(the design doc is removed; remaining items captured here).
+Pending tasks from the original `phase1-dependency-recovery-design.md`.
+Opportunistic — don't block Track D on these.
 
 - **`requirements.txt` support** in `DependencyManager`. The
   `DockerExecutor` already has `install_requirements_file`; expose it via
@@ -58,70 +72,113 @@ Pending tasks from the original `phase1-dependency-recovery-design.md`
   `network` / `permission` so the Reflector can act differently per
   category.
 - **Optional install confirmation**. Add `docker_ask_before_install: bool`
-  to `AgentConfig`; when true, pause before `pip install` in
-  interactive mode. Mostly UX work; lowest priority.
-- **Persist successful installations to long-term memory**. The
-  `DependencyManager` docstring promises this and the data fits naturally
-  into the Phase D `environment_context` already stored on Patterns.
-  Use that path; don't add a separate store.
+  to `AgentConfig`; pause before `pip install` in interactive mode. UX
+  only; lowest priority.
+- **Persist successful installations to long-term memory** via the Phase D
+  `environment_context` already stored on Patterns; don't add a separate
+  store.
 
-### Track C — Demo and tiny benchmark
+### Track C — close out the memory demo
 
-Validates that the Phase A/B/C/D memory infrastructure actually does
-what it claims. Cheap, high-signal, and unblocks the publishable track.
+The runner is merged; what's left is to actually run it and write the
+1-pager. Cheap, and it shakes out the harness before the bigger Track D
+benchmark generalizes the same runner.
 
-- **5–10 related task script**. Pick a coherent batch (e.g. CSV
-  manipulation, simple HTTP clients, small data-structure problems).
-  Run the agent sequentially against local Ollama with
-  `--docker-persistent` so env capture works. Log per-task: iterations to
-  success, which Patterns/Learnings were retrieved, score breakdowns.
-- **Short report** (in `docs/`) with: per-task iteration counts, a
-  qualitative pass on whether retrieved Learnings actually informed the
-  plan, any infrastructure bugs surfaced. Not a paper — a 1-page
-  sanity-check artifact.
-- **Tie-in**: any bug surfaced here gets folded back into Track A.
+- **Score-breakdown logging** (the runner's standing TODO): hook
+  `LongTermMemory.find_similar_solutions` / the Planner to capture the
+  component scores (semantic / project_type / deps / installed-package) per
+  retrieval, not just which Patterns/Learnings came back.
+- **Run + report**: run the 8-task CSV batch on the 3.12 venv with
+  `--docker-persistent --docker-image crucible-runtime`; write
+  `docs/track-c-report.md` (per-task iterations-to-success, whether
+  retrieved Learnings plausibly informed the plan, any infra bugs).
+- **Tie-in**: any bug surfaced folds back into the codebase before Phase 3.
 
 ### Track D — Hypothesis-scored predictions (publishable)
 
-Original `NEXT_STEPS.md` Phase 2. Still the most ambitious track and
-still the one most likely to produce a writeup. Untouched.
-
-**Thesis**: the agent learns to predict its own failures. The Reflector
-emits falsifiable predictions on each failure; a replay engine tests
-stored predictions against new code; predictions are scored and pruned
-over time. After 100+ tasks, a calibrated antipattern catalog with real
-numbers.
+**Thesis**: the agent learns to predict its own failures. Phases 1 and 2
+are done (see "Where we are") — predictions are emitted, replayed, scored,
+and pruned. What remains is to run it at scale and report whether the
+predictions are *calibrated*.
 
 **v1 constraint**: input-based predictions only (a concrete adversarial
 input + the failure type it should trigger). Pattern-matching and
-conditional predictions deferred.
+conditional predictions stay deferred.
 
-**Compute model**: local Ollama (`qwen2.5-coder:7b`), no cloud LLMs —
-removes cost as a variable in the calibration analysis.
+#### Phase 3 — Benchmark
 
-Sketched weekends:
+Generalize `bench/track_c_runner.py` into `bench/runner.py` and run enough
+tasks to accumulate replay verdicts.
 
-1. **Schema + emission** — `Prediction` dataclass, extend
-   `Reflector.SYSTEM_PROMPT` to emit a prediction field on failed
-   iterations, strict schema gate (drop predictions without a concrete
-   `trigger_input`), store in `agent/memory/predictions.jsonl`.
-2. ~~**Replay engine**~~ — **done** (`agent/replay.py`, PR TBD). On task
-   success, every prediction linked to that task's failures
-   (`find_by_failure_id`) is replayed against the final passing code: a
-   deterministic driver is appended to the solution, `trigger_input` is
-   `ast.literal_eval`'d and fed to the selected public entry point in the
-   sandbox, and the outcome is classified **Confirmed** / **Falsified** /
-   **Off-topic** (off-topic = couldn't apply the input; never counted).
-   Verdicts write back via `PredictionMemory.record_replays`; auto-retire
-   at `times_tested ≥ 10 AND confirmation_rate < 0.30`. **Record-only** —
-   the `predictions_gate_enabled` hook exists but is inert; blocking a
-   success on a confirmed latent bug is deferred until the phase-4
-   calibration data justifies trusting predictions enough to act on them.
-3. **Benchmark** — curate 30–50 deterministic small coding problems.
-   Build `bench/runner.py` (N=5 default per problem). Smoke run first.
-4. **Analysis + writeup** — full run with persisted predictions +
-   outcomes. `bench/REPORT.md` with calibration curve, surviving
-   predictions catalog, convergence variance. Medium post draft.
+- **Problem set** — 30–50 *deterministic* small Python problems
+  (`bench/problems.py`). Hard requirements, learned from earlier runs:
+  - **Single-file `solution` contract** so the replay entry-point selector
+    works. Prefer **one public function per problem** (or a function whose
+    name echoes the goal) — multiple ambiguous functions classify Off-topic
+    and yield no calibration signal.
+  - **No web / server tasks.** The local 7B model can't reliably author a
+    valid frozen suite for FastAPI (it writes server-launch tests), and
+    multi-file isn't replay-scoped. Stick to string/list/dict algorithms,
+    math, parsing, small data structures — domains with obvious adversarial
+    inputs (`[]`, `-1`, `''`, `None`, `0`) the Reflector can predict.
+- **Reps (N)** — run each problem N times (default 5) for convergence
+  variance and to surface more failures (→ more predictions → more
+  replays). 40 problems × 5 ≈ 200 task runs.
+- **Compute model** — local Ollama `qwen2.5-coder:7b`, fixed, to keep cost
+  out of the calibration analysis. Optionally a second fixed model as a
+  sensitivity check, but the headline run uses one.
+- **`bench/runner.py`** — per task run, append to a JSONL: problem id, rep,
+  status, iterations-to-success, retrieved patterns/learnings/predictions,
+  and **`state.replay_report`** (the confirmed/falsified/off-topic
+  verdicts). This is the raw material for Phase 4.
+- **Memory mode** — persist memory across the *entire* run (don't reset per
+  problem): predictions need to be surfaced and replayed across reps and
+  related problems to accumulate data. Record run order so order-effects
+  are visible.
+- **Pre-reqs (now real, don't skip)**:
+  - 3.12 venv with `sentence-transformers` installed — otherwise
+    `find_relevant` and pattern recall are no-ops and the "memory helped"
+    analysis is dead.
+  - Prebaked `crucible-runtime` image (`./docker/build.sh`) so
+    `container_setup` doesn't dominate wall-clock.
+  - **Smoke run first**: 3 problems × 2 reps to shake out harness bugs
+    before the full run.
+
+#### Phase 4 — Calibration + writeup
+
+Turn the JSONL into `bench/REPORT.md` with real numbers.
+
+- **Calibration is aggregate-by-confidence, not per-prediction.** Important
+  design constraint: `failure_id = sha256(normalize(error) : code[:100])` is
+  derived from the *failing code*, which changes every rep, so a prediction
+  id (`sha256(failure_id : trigger_input)`) is usually unique per task and
+  gets replayed ~once. Per-prediction confirmation rates are therefore mostly
+  0/1 or 1/1 — too sparse to calibrate individually. Instead **bucket all
+  replay verdicts by the prediction's self-reported `confidence`** and
+  compute the confirmation rate per bucket. That is the headline result:
+  *are higher-confidence self-predictions actually confirmed more often?*
+- **Off-topic rate** — fraction of replays that couldn't be applied (bad
+  literal, arity/boundary error, ambiguous entry). This is the integrity
+  metric: a high rate means the entry-point heuristic is weak and the
+  calibration sample is thin. **Report it prominently — never hide it.**
+- **Surviving-predictions catalog** — the concrete antipatterns that
+  confirmed (e.g. "`[]` → IndexError" on first-element problems). Pull
+  non-retired, high-confirmation predictions from `PredictionMemory`.
+- **Retirement stats** — from `get_stats`: how many predictions auto-retired
+  (`times_tested ≥ 10 AND rate < 0.30`). Note retirement is a *long-horizon*
+  mechanism that accrues across many runs sharing one memory store; within a
+  single benchmark run it will rarely fire (see the id note above). Decide
+  whether to (a) accept it as cross-run, (b) lower the threshold for the
+  analysis, or (c) leave it and report "0 retired this run, by design".
+- **Convergence variance** — iterations-to-success distribution per problem
+  across reps; does it tighten as memory fills?
+- **Memory-helped analysis** — correlational: did surfacing predictions to
+  the Planner reduce iterations or off-topic failures on later related
+  problems?
+- **Writeup** — `bench/REPORT.md` + a Medium/LinkedIn draft. This is the
+  artifact that gates the blog post: publish once the calibration curve and
+  surviving-predictions catalog exist (the mechanism-only version is too
+  early; the claim is "calibrated self-prediction", narrow and true).
 
 ### Dismissed (do not re-explore)
 
@@ -131,13 +188,18 @@ Sketched weekends:
 - Cloud LLM benchmark numbers — confounds the calibration analysis.
 - Pattern-based / conditional predictions in v1 — defer until input-based
   predictions have run on the full benchmark.
+- Parallel test/code generation — code generation deliberately consumes the
+  frozen test suite (test-first contract); parallelizing sacrifices first-pass
+  success for marginal latency. See the PR discussion.
 
 ## Recommended order
 
-1. ~~**Track A**~~ — done. Tag `v0.1.0` after the PR merges.
-2. **Track C** next (small, validates the memory work).
-3. **Track B** opportunistically — pick off tasks as the demo exposes
-   gaps. Don't block Track D on a complete `DependencyManager`.
-4. **Track D** — the long pole. Plan for ~4 weekends part-time.
-
-Total: roughly 4–5 weeks part-time remaining → one publishable artifact.
+1. ~~**Track A**~~ — done (`v0.1.0`).
+2. ~~**Track D phases 1–2**~~ — done (predictions + replay engine).
+3. **Track C close-out** — small; run the demo + write the 1-pager, fixing
+   any harness bugs that would also bite Phase 3.
+4. **Track D phase 3 (benchmark)** — the long pole. Build `bench/runner.py`
+   on the Track C runner, smoke-run, then the full 40×5.
+5. **Track D phase 4 (calibration + writeup)** — the publishable artifact.
+6. **Track B** — opportunistic; pick off items as the benchmark exposes
+   dependency-recovery gaps.
