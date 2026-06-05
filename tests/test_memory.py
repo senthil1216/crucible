@@ -6,7 +6,9 @@ import hashlib
 import math
 from pathlib import Path
 import shutil
+import sys
 import tempfile
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -124,6 +126,28 @@ def temp_dir():
 @pytest.fixture
 def fake_embeddings():
     return FakeEmbeddingClient()
+
+
+def test_embedding_client_degrades_when_model_load_fails(monkeypatch, capsys):
+    class BrokenSentenceTransformer:
+        def __init__(self, model_name):
+            raise OSError(f"{model_name} is not cached")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=BrokenSentenceTransformer),
+    )
+    monkeypatch.setattr(EmbeddingClient, "_warning_shown", False)
+
+    client = EmbeddingClient(model_name="missing-model")
+
+    assert client.encode("sort a list") == []
+    assert client.available is False
+
+    err = capsys.readouterr().err
+    assert "Semantic memory disabled" in err
+    assert "missing-model" in err
 
 
 class TestLongTermMemory:
