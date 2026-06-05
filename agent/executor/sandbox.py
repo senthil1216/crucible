@@ -152,20 +152,14 @@ class SandboxedExecutor:
 
             report_path = workspace / ".report.json"
             junit_path = workspace / ".report.xml"
-            cmd = [
-                sys.executable, "-m", "pytest", ".",
-                "-p", "no:cacheprovider",
-                # JUnit XML is built into pytest (no plugin required) and is our
-                # fallback when pytest-json-report is unavailable.
-                f"--junitxml={junit_path}",
-                "-q",
-            ]
+            cmd = [sys.executable, "-m", "pytest", ".", "-p", "no:cacheprovider"]
             # The richer JSON report is opt-in: only request it when the plugin
             # is installed, otherwise pytest exits with a usage error.
             if json_report_available():
-                cmd[4:4] = [
-                    "--json-report", f"--json-report-file={report_path}"
-                ]
+                cmd += ["--json-report", f"--json-report-file={report_path}"]
+            # JUnit XML is built into pytest (no plugin required) and is our
+            # fallback when pytest-json-report is unavailable.
+            cmd += [f"--junitxml={junit_path}", "-q"]
 
             preexec = None
             if os.name == "posix":

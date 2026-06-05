@@ -12,7 +12,9 @@
 
 VENV   ?= .venv
 PYTHON ?= python3
-PY     := $(shell [ -x $(VENV)/bin/python ] && echo $(VENV)/bin/python || echo $(PYTHON))
+# Immediate (:=) on purpose: resolve the interpreter once at parse time so a
+# `make test` immediately after `make setup` picks up the freshly created venv.
+PY     := $(shell [ -x "$(VENV)/bin/python" ] && echo "$(VENV)/bin/python" || echo $(PYTHON))
 
 .DEFAULT_GOAL := help
 .PHONY: help setup test cov smoke bench-smoke clean
