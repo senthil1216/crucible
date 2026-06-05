@@ -240,6 +240,7 @@ def build_test_results_from_junit(
 
     tests_passed = 0
     tests_failed = 0
+    tests_skipped = 0        # collected but not run; not a pass and not a failure
     test_errors = 0          # setup/call/teardown errors on a real test
     collection_errors = 0    # whole module failed to import/collect
     failed_names: List[str] = []
@@ -280,12 +281,16 @@ def build_test_results_from_junit(
                     "message": _junit_message(error)[:1500],
                 })
             elif skipped is not None:
-                continue
+                tests_skipped += 1
             else:
                 tests_passed += 1
 
-    # Real tests selected = everything except collection-error placeholders.
-    tests_collected = tests_passed + tests_failed + test_errors
+    # Collected = every real test selected (passed/failed/errored/skipped),
+    # excluding collection-error placeholders. Skipped tests are collected but
+    # are neither passes nor failures — this matches the JSON path, which takes
+    # `collected` from pytest's summary (skipped included), so the same run is
+    # gated identically regardless of plugin availability.
+    tests_collected = tests_passed + tests_failed + test_errors + tests_skipped
 
     passed = (
         tests_collected > 0

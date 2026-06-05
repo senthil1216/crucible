@@ -52,6 +52,28 @@ ALL_PASS_XML = (
     '</testsuite></testsuites>'
 )
 
+ALL_SKIPPED_XML = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<testsuites name="pytest tests"><testsuite name="pytest" errors="0" '
+    'failures="0" skipped="2" tests="2" time="0.0">'
+    '<testcase classname="tests.test_s" name="test_a" time="0.0">'
+    '<skipped type="pytest.skip" message="needs network">skipped</skipped>'
+    '</testcase>'
+    '<testcase classname="tests.test_s" name="test_b" time="0.0">'
+    '<skipped type="pytest.skip" message="needs network">skipped</skipped>'
+    '</testcase></testsuite></testsuites>'
+)
+
+PASS_AND_SKIP_XML = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<testsuites name="pytest tests"><testsuite name="pytest" errors="0" '
+    'failures="0" skipped="1" tests="2" time="0.0">'
+    '<testcase classname="tests.test_s" name="test_a" time="0.0" />'
+    '<testcase classname="tests.test_s" name="test_b" time="0.0">'
+    '<skipped type="pytest.skip" message="needs network">skipped</skipped>'
+    '</testcase></testsuite></testsuites>'
+)
+
 
 class TestJUnitParser:
     def test_all_pass(self):
@@ -84,6 +106,26 @@ class TestJUnitParser:
         assert r.passed is False
         assert r.tests_collected == 0
         assert r.error_type == "NoTestsCollected"
+
+    def test_skipped_count_toward_collected_not_passed(self):
+        # An all-skipped suite is collected (so it is NOT "NoTestsCollected"),
+        # but skipped tests are neither passes nor failures. This mirrors the
+        # JSON path, which takes `collected` from pytest's summary (skipped
+        # included) — the same run must be gated identically either way.
+        r = build_test_results_from_junit(ALL_SKIPPED_XML, "", "", 0)
+        assert r.tests_collected == 2
+        assert r.tests_passed == 0
+        assert r.tests_failed == 0
+        assert r.tests_errors == 0
+        assert r.error_type != "NoTestsCollected"
+        assert r.passed is True
+
+    def test_pass_and_skip(self):
+        r = build_test_results_from_junit(PASS_AND_SKIP_XML, "", "", 0)
+        assert r.passed is True
+        assert r.tests_collected == 2
+        assert r.tests_passed == 1
+        assert r.tests_failed == 0
 
     def test_unparseable_returns_none(self):
         assert build_test_results_from_junit("not xml <<<", "", "", 1) is None
