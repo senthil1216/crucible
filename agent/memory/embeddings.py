@@ -21,12 +21,13 @@ class EmbeddingClient:
     Wraps a sentence-transformers model with a lazy load so importing this
     module is cheap. The first call to `encode` pays the load cost.
 
-    If sentence-transformers is not installed, encode() returns [] (empty list).
-    Callers (LongTermMemory / FailureMemory) treat empty embeddings as "no
-    semantic signal", falling back to structured filters (project_type,
-    dependencies, etc.). Cosine similarity on empty/mismatched vectors is 0.0.
-    This allows the agent to run without the heavy optional dependency while
-    still benefiting from memory for exact/structured matches.
+    If sentence-transformers is not installed, or if the local embedding model
+    cannot be loaded, encode() returns [] (empty list). Callers (LongTermMemory
+    / FailureMemory) treat empty embeddings as "no semantic signal", falling
+    back to structured filters (project_type, dependencies, etc.). Cosine
+    similarity on empty/mismatched vectors is 0.0. This allows the agent to run
+    without the heavy optional dependency or a cached model while still
+    benefiting from memory for exact/structured matches.
     """
 
     _instance: Optional["EmbeddingClient"] = None
@@ -44,6 +45,23 @@ class EmbeddingClient:
             cls._instance = cls()
         return cls._instance
 
+    def _disable_with_warning(self, reason: str) -> None:
+        if not EmbeddingClient._warning_shown:
+            import sys
+
+            print(
+                "⚠️  Semantic memory disabled: embedding model unavailable.\n"
+                f"   Reason: {reason}\n"
+                "   Long-term memory will fall back to structured filters only\n"
+                "   (project type, dependencies, environment packages).\n"
+                "   For full semantic recall of past solutions and failures:\n"
+                "       pip install -r requirements.txt",
+                file=sys.stderr,
+            )
+            EmbeddingClient._warning_shown = True
+        self._embedding_available = False
+        self._model = None
+
     def _ensure_loaded(self) -> None:
         if self._embedding_available is False:
             return
@@ -53,19 +71,11 @@ class EmbeddingClient:
                 self._model = SentenceTransformer(self.model_name)
                 self._embedding_available = True
             except ImportError:
-                if not EmbeddingClient._warning_shown:
-                    import sys
-                    print(
-                        "⚠️  Semantic memory disabled: 'sentence-transformers' not installed.\n"
-                        "   Long-term memory will fall back to structured filters only\n"
-                        "   (project type, dependencies, environment packages).\n"
-                        "   For full semantic recall of past solutions and failures:\n"
-                        "       pip install -r requirements.txt",
-                        file=sys.stderr,
-                    )
-                    EmbeddingClient._warning_shown = True
-                self._embedding_available = False
-                self._model = None
+                self._disable_with_warning("'sentence-transformers' is not installed")
+            except Exception as exc:
+                self._disable_with_warning(
+                    f"could not load '{self.model_name}' ({exc})"
+                )
 
     def encode(self, text: str) -> List[float]:
         """Return a dense vector for `text` as a plain Python list.
