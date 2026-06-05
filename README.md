@@ -1,8 +1,18 @@
-# Crucible — Self-Improving Coding Agent
+# Crucible — Testable Memory & Failure-Prediction Replay for Coding Agents
 
-An autonomous coding agent that writes code, runs tests, and learns from its successes and failures. Built around a **Plan → Execute → Test → Reflect** loop with an embedding-backed memory hierarchy.
+A coding agent that doesn't just *claim* to learn — it makes its learning **testable**. Crucible writes code, gates success on a **real pytest run** (never an exit code), and stores what it learns as structured memory. Before each task it **predicts how it will fail**, and after a success it **replays those predictions against the outcome** — so "memory" becomes a measurable signal (confirmed / falsified / off-topic) instead of an unverifiable promise.
+
+It is built around a **Plan → Execute → Test → Reflect** loop with an embedding-backed memory hierarchy.
 
 > **crucible** /ˈkruːsɪb(ə)l/ — *noun* — A place or situation in which different elements interact to produce something new.
+
+### What makes it different
+
+- **Testable memory** — success means *a real pytest suite collected ≥1 test and all passed*. An empty or hollow suite never counts as a pass (the rule lives in [`agent/pytest_report.py`](agent/pytest_report.py)). Learnings are extracted only from genuinely verified runs.
+- **Failure-prediction replay** — the agent predicts likely failure modes up front, then after solving replays each prediction against what actually happened. This calibration loop (Track D) measures whether the agent's stored intuition is *right*, not just present.
+- **No-plugin test gate** — the gate prefers `pytest-json-report` but falls back to pytest's built-in JUnit XML, so it works on a clean install with no extra plugins.
+
+> Crucible is an exploratory prototype, not a production agent. "Self-improving" here is a measurable claim, not a marketing one — and the non-Docker sandbox is *ergonomic isolation*, not a security boundary (see [Sandbox honesty](#sandbox-honesty)).
 
 ```
 User Goal → [Plan] → [Execute] → [Test] → [Reflect] → Success?
@@ -15,16 +25,34 @@ User Goal → [Plan] → [Execute] → [Test] → [Reflect] → Success?
 
 ## ✨ Key Features
 
-- **🔄 Self-Improving Loop**: iterates on failures until success or max attempts
-- **🧠 Embedding-Backed Memory**: short-term context, semantic long-term patterns, failure memory, structured Learnings extracted on success
+- **✅ Testable memory**: success is gated on a real pytest run (≥1 test collected, none failed); Learnings are extracted only from verified runs
+- **🔮 Failure-prediction replay**: predicts failure modes before solving, then replays them against the outcome for a calibration signal (Track D)
+- **🧠 Embedding-Backed Memory**: short-term context, semantic long-term patterns, failure memory, structured Learnings
 - **📦 Multi-File Workspace**: optional persistent Docker container per task with file read/write, multi-file generation, and automatic dependency recovery via `DependencyManager`
-- **🤖 Multi-LLM Support**: OpenAI, Anthropic, Kimi, DeepSeek, Ollama (local), or any custom `LLMClient`
+- **🤖 Multi-LLM Support**: OpenAI, Anthropic, Kimi, DeepSeek, Ollama (local), a deterministic `mock`, or any custom `LLMClient`
 - **💾 State Persistence**: checkpoints after every iteration; resume after interruption
 - **📊 Observable**: callbacks for plan, code, test, reflect, and iteration events
 
-> Crucible is an exploratory prototype, not a production agent. The non-Docker sandbox is *ergonomic isolation*, not a security boundary — see [Sandbox honesty](#sandbox-honesty) below.
-
 ## 🚀 Quick Start
+
+### Developer setup (offline, no API keys, ~1 command)
+
+Recommended interpreter: **Python 3.12** (see [`.python-version`](.python-version); 3.10+ should work).
+
+```bash
+git clone <repo>
+cd crucible
+make setup        # create .venv and install dev dependencies (requirements-dev.txt)
+make test         # run the test suite
+make smoke        # run ONE agent task end-to-end with the deterministic mock LLM
+make bench-smoke  # run the benchmark pipeline offline (mock LLM, no Docker)
+```
+
+`make setup` is the one-command path: it creates a local `.venv` and installs everything in [`requirements-dev.txt`](requirements-dev.txt) (runtime deps + `pytest`, `pytest-asyncio`, `pytest-json-report`, `docker`, `anthropic`). The `smoke` / `bench-smoke` targets need **no network, no API key, and no Docker** — they use the built-in `mock` LLM and the local subprocess sandbox, so a new user can confirm the whole loop works in seconds. Run `make help` to list targets.
+
+> `bench-smoke` is a *pipeline shake-out* (does the benchmark harness run end-to-end?), not a capability measurement — the mock LLM is deterministic, not smart. For a real benchmark use `python -m bench.runner --smoke --llm ollama` with Docker + Ollama.
+
+To run the agent against a real model instead, pick one of the options below.
 
 ### Option 1: Local LLM (free, private, offline)
 
@@ -121,7 +149,7 @@ crucible/
 │   ├── phase2-workspace-design.md
 │   └── long-term-memory-improvements-design.md
 ├── examples/                    # Usage examples
-├── tests/                       # Test suite (52 tests)
+├── tests/                       # Test suite (mock-based; no network/Docker)
 ├── ARCHITECTURE.md
 ├── LOCAL_LLM_GUIDE.md
 ├── KIMI_SETUP.md
@@ -266,10 +294,12 @@ config = AgentConfig(
 ## 🧪 Testing
 
 ```bash
-pytest                       # 52 tests
-pytest --cov=agent
+make test                    # the whole suite (or: pytest -q)
+make cov                     # with coverage (or: pytest --cov=agent)
 pytest tests/test_memory.py -v
 ```
+
+The suite is fully mock-based — no network, Docker, or model downloads required, so it runs on a clean install with only `pytest` + `pytest-asyncio`. The success gate prefers `pytest-json-report` but falls back to pytest's built-in JUnit XML when the plugin is absent, so the tests stay green either way (see [`tests/test_pytest_report_fallback.py`](tests/test_pytest_report_fallback.py)).
 
 ## 📊 Monitoring
 
@@ -298,10 +328,10 @@ agent = SelfImprovingAgent(
 
 ## 🔧 Requirements
 
-- Python 3.10+ (the code uses PEP 604/585 type syntax)
-- `openai>=1.0.0`, `httpx>=0.24.0`, `sentence-transformers>=2.2.0` (installed via `requirements.txt`)
-- Optional: `docker` (`pip install docker`) for `--docker` / `--docker-persistent`
-- Optional: `anthropic` for the Anthropic backend
+- **Python 3.12 recommended** (pinned in [`.python-version`](.python-version)); 3.10+ works (the code uses PEP 604/585 type syntax)
+- Runtime: `openai>=1.0.0`, `httpx>=0.24.0`, `sentence-transformers>=2.2.0` (via `requirements.txt`)
+- Development: `make setup` installs [`requirements-dev.txt`](requirements-dev.txt) — adds `pytest`, `pytest-asyncio`, `pytest-json-report`, `pytest-cov`, `docker`, `anthropic`
+- Optional at runtime: `docker` for `--docker` / `--docker-persistent`; `anthropic` for the Anthropic backend
 - For local LLMs: [Ollama](https://ollama.com)
 
 ## 📝 License

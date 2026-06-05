@@ -37,7 +37,9 @@ from typing import Any, Dict, List, Optional
 
 # Module-level imports so import errors surface immediately, not mid-run.
 from agent.core import SelfImprovingAgent
-from agent.llm_clients import OllamaClient, OpenAIClient, AnthropicClient
+from agent.llm_clients import (
+    OllamaClient, OpenAIClient, AnthropicClient, MockLLMClient,
+)
 from agent.models import AgentConfig, LoopConfig, IterationState
 
 from bench.problems import PROBLEMS, ProblemSpec
@@ -52,6 +54,9 @@ SMOKE_REPS = 2
 # ---------------------------------------------------------------------------
 
 def make_llm(provider: str, model: Optional[str]):
+    if provider == "mock":
+        # Deterministic, offline, no network — for pipeline shake-out only.
+        return MockLLMClient()
     if provider == "ollama":
         import os
         return OllamaClient(
@@ -241,11 +246,12 @@ async def amain(args: argparse.Namespace) -> int:
         reps = args.reps
 
     llm = make_llm(args.llm, args.model)
+    use_docker = not args.no_docker
     config = AgentConfig(
         loop=LoopConfig(max_iterations=args.max_iterations),
         workspace_path=Path(args.workspace),
-        use_docker=True,
-        docker_persistent=True,
+        use_docker=use_docker,
+        docker_persistent=use_docker,
         docker_image=args.docker_image,
     )
     agent = SelfImprovingAgent(llm_client=llm, config=config)
@@ -280,8 +286,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smoke", action="store_true",
                    help=f"Shake-out run: first {SMOKE_PROBLEMS} problems × "
                         f"{SMOKE_REPS} reps")
-    p.add_argument("--llm", choices=["ollama", "openai", "anthropic"],
-                   default="ollama")
+    p.add_argument("--llm", choices=["ollama", "openai", "anthropic", "mock"],
+                   default="ollama",
+                   help="LLM provider. 'mock' is offline/deterministic for "
+                        "pipeline shake-out (not a capability measure).")
+    p.add_argument("--no-docker", action="store_true",
+                   help="Run the agent in the local subprocess sandbox instead "
+                        "of Docker (needed for an offline smoke run).")
     p.add_argument("--model", default=None,
                    help="Model name override (default: provider's default)")
     p.add_argument("--docker-image", default="crucible-runtime",

@@ -31,7 +31,7 @@ except ImportError:
 from agent.models import CodeArtifact, TestResults
 from agent.safety.checker import SafetyChecker
 from agent.executor.sandbox import ExecutionConfig, _is_test_path
-from agent.pytest_report import build_test_results
+from agent.pytest_report import build_test_results_preferring_json
 
 
 class DockerExecutor:
@@ -471,16 +471,37 @@ class DockerExecutor:
         start_time = time.time()
         self.write_files(files)
         report_rel = ".report.json"
+        junit_rel = ".report.xml"
+        # Always emit the built-in JUnit XML as a fallback, and additionally the
+        # richer JSON report only when the plugin is present in the container
+        # (container setup installs it; a bare image may not have it).
+        has_json = self._container_has_json_report()
+        json_flags = (
+            f"--json-report --json-report-file={report_rel} " if has_json else ""
+        )
         cmd = (
             f"python -m pytest . -p no:cacheprovider "
-            f"--json-report --json-report-file={report_rel} -q"
+            f"{json_flags}--junitxml={junit_rel} -q"
         )
         exit_code, stdout, stderr = self.run_command_in_workspace(cmd)
-        report_text = self.read_file(report_rel)
-        return build_test_results(
-            report_text, stdout, stderr, exit_code,
+        report_text = self.read_file(report_rel) if has_json else None
+        junit_text = self.read_file(junit_rel)
+        return build_test_results_preferring_json(
+            report_text, junit_text, stdout, stderr, exit_code,
             execution_time=time.time() - start_time,
         )
+
+    def _container_has_json_report(self) -> bool:
+        """Whether `pytest-json-report` is importable inside the container."""
+        if not self._persistent_container:
+            return False
+        try:
+            check = self._persistent_container.exec_run(
+                ["python", "-c", "import pytest_jsonreport"]
+            )
+            return getattr(check, "exit_code", 1) == 0
+        except Exception:
+            return False
 
     def capture_environment(self) -> dict:
         """
