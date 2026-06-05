@@ -15,6 +15,7 @@ failure mode the old exit-code gate allowed.
 """
 
 import json
+import xml.etree.ElementTree as ET
 from typing import Optional, List, Dict, Any
 
 from agent.models import TestResults
@@ -186,3 +187,174 @@ def build_test_results(
         test_failures=test_failures,
         from_pytest=True,
     )
+
+
+def json_report_available() -> bool:
+    """True if the `pytest-json-report` plugin can be imported in this interpreter.
+
+    Used to decide whether to ask pytest for a `--json-report` (the richest
+    machine-readable format). When it is unavailable we fall back to pytest's
+    built-in JUnit XML reporter, which needs no third-party plugin — see
+    `build_test_results_from_junit`. This keeps the success gate working on a
+    clean install that hasn't (or can't) install the plugin.
+    """
+    try:
+        import pytest_jsonreport  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def build_test_results_from_junit(
+    xml_text: Optional[str],
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    execution_time: float = 0.0,
+) -> Optional[TestResults]:
+    """Parse pytest's built-in JUnit XML report into a TestResults.
+
+    This is the no-plugin fallback for `build_test_results`. It applies the exact
+    same success rule:
+
+        passed == (tests_collected > 0
+                   and no failures
+                   and no errors
+                   and no collection errors)
+
+    Returns None if the XML is missing or unparseable, so the caller can fall
+    back further (to the safe-fail path) rather than inferring success.
+    """
+    if not xml_text:
+        return None
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+
+    # The root may be <testsuites> wrapping one or more <testsuite>, or a bare
+    # <testsuite>. Collect every testcase from whichever shape we got.
+    suites = root.findall("testsuite")
+    if root.tag == "testsuite":
+        suites = [root]
+
+    tests_passed = 0
+    tests_failed = 0
+    tests_skipped = 0        # collected but not run; not a pass and not a failure
+    test_errors = 0          # setup/call/teardown errors on a real test
+    collection_errors = 0    # whole module failed to import/collect
+    failed_names: List[str] = []
+    test_failures: List[Dict[str, Any]] = []
+
+    for suite in suites:
+        for case in suite.findall("testcase"):
+            classname = (case.get("classname") or "").strip()
+            name = case.get("name") or "<unknown>"
+            nodeid = f"{classname}::{name}" if classname else name
+
+            failure = case.find("failure")
+            error = case.find("error")
+            skipped = case.find("skipped")
+
+            if failure is not None:
+                tests_failed += 1
+                failed_names.append(nodeid)
+                test_failures.append({
+                    "nodeid": nodeid,
+                    "outcome": "failed",
+                    "message": _junit_message(failure)[:1500],
+                })
+            elif error is not None:
+                # pytest emits collection failures as a testcase with an empty
+                # classname (the whole module never produced real tests). A
+                # non-empty classname means a real test errored in setup/call.
+                if classname:
+                    test_errors += 1
+                    outcome = "error"
+                else:
+                    collection_errors += 1
+                    outcome = "collection-error"
+                failed_names.append(nodeid)
+                test_failures.append({
+                    "nodeid": nodeid,
+                    "outcome": outcome,
+                    "message": _junit_message(error)[:1500],
+                })
+            elif skipped is not None:
+                tests_skipped += 1
+            else:
+                tests_passed += 1
+
+    # Collected = every real test selected (passed/failed/errored/skipped),
+    # excluding collection-error placeholders. Skipped tests are collected but
+    # are neither passes nor failures — this matches the JSON path, which takes
+    # `collected` from pytest's summary (skipped included), so the same run is
+    # gated identically regardless of plugin availability.
+    tests_collected = tests_passed + tests_failed + test_errors + tests_skipped
+
+    passed = (
+        tests_collected > 0
+        and tests_failed == 0
+        and test_errors == 0
+        and collection_errors == 0
+    )
+
+    error_type = None
+    if not passed:
+        if tests_collected == 0 and collection_errors == 0:
+            error_type = "NoTestsCollected"
+        else:
+            blob = "\n".join(f.get("message", "") for f in test_failures) + "\n" + stderr
+            error_type = classify_error(blob) or "TestFailure"
+
+    return TestResults(
+        passed=passed,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        execution_time=execution_time,
+        error_type=error_type,
+        failed_tests=failed_names,
+        tests_collected=tests_collected,
+        tests_passed=tests_passed,
+        tests_failed=tests_failed,
+        tests_errors=test_errors + collection_errors,
+        test_failures=test_failures,
+        from_pytest=True,
+    )
+
+
+def _junit_message(node: "ET.Element") -> str:
+    """Pull a readable message out of a JUnit <failure>/<error> element."""
+    text = (node.text or "").strip()
+    if text:
+        return text
+    return (node.get("message") or "").strip()
+
+
+def build_test_results_preferring_json(
+    json_text: Optional[str],
+    junit_text: Optional[str],
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    execution_time: float = 0.0,
+) -> TestResults:
+    """Build a TestResults from whichever report is usable, richest first.
+
+    Order: pytest-json-report → JUnit XML → safe-fail. Executors always request
+    the JUnit XML (built-in) and additionally request the JSON report when the
+    plugin is present, so there is always at least one parseable report on a
+    clean install.
+    """
+    if parse_report(json_text) is not None:
+        return build_test_results(json_text, stdout, stderr, exit_code, execution_time)
+
+    junit = build_test_results_from_junit(
+        junit_text, stdout, stderr, exit_code, execution_time
+    )
+    if junit is not None:
+        return junit
+
+    # Neither report was usable — preserve the existing safe-fail behaviour.
+    return build_test_results(None, stdout, stderr, exit_code, execution_time)

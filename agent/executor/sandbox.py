@@ -23,7 +23,10 @@ import time
 
 from agent.models import CodeArtifact, TestResults, AgentConfig
 from agent.safety.checker import SafetyChecker
-from agent.pytest_report import build_test_results
+from agent.pytest_report import (
+    build_test_results_preferring_json,
+    json_report_available,
+)
 
 
 def _apply_rlimits(cpu_seconds: int) -> None:
@@ -148,12 +151,15 @@ class SandboxedExecutor:
                 target.write_text(content)
 
             report_path = workspace / ".report.json"
-            cmd = [
-                sys.executable, "-m", "pytest", ".",
-                "-p", "no:cacheprovider",
-                "--json-report", f"--json-report-file={report_path}",
-                "-q",
-            ]
+            junit_path = workspace / ".report.xml"
+            cmd = [sys.executable, "-m", "pytest", ".", "-p", "no:cacheprovider"]
+            # The richer JSON report is opt-in: only request it when the plugin
+            # is installed, otherwise pytest exits with a usage error.
+            if json_report_available():
+                cmd += ["--json-report", f"--json-report-file={report_path}"]
+            # JUnit XML is built into pytest (no plugin required) and is our
+            # fallback when pytest-json-report is unavailable.
+            cmd += [f"--junitxml={junit_path}", "-q"]
 
             preexec = None
             if os.name == "posix":
@@ -181,8 +187,10 @@ class SandboxedExecutor:
                 )
 
             report_text = report_path.read_text() if report_path.exists() else None
-            return build_test_results(
+            junit_text = junit_path.read_text() if junit_path.exists() else None
+            return build_test_results_preferring_json(
                 report_text,
+                junit_text,
                 result.stdout,
                 result.stderr,
                 result.returncode,

@@ -1,0 +1,33 @@
+# Development & testing dependencies for Crucible.
+#
+#   python -m pip install -r requirements-dev.txt
+#
+# This pulls in the runtime deps (via requirements.txt) plus everything needed
+# to run the test suite, the offline smoke, and the benchmark harness.
+#
+# Recommended interpreter: Python 3.12 (see .python-version). The codebase uses
+# PEP 604/585 type syntax and is tested on 3.12; 3.10+ should work.
+
+-r requirements.txt
+
+# --- Test suite -----------------------------------------------------------
+# The suite itself only needs pytest + pytest-asyncio (it is fully mock-based).
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+
+# The agent's success gate parses pytest's machine-readable report. The JSON
+# report (pytest-json-report) is preferred; when it is absent the gate falls
+# back to pytest's built-in JUnit XML (no plugin needed). Installing it here
+# exercises the preferred path.
+pytest-json-report>=1.5.0
+
+# Coverage (optional, used by `pytest --cov`).
+pytest-cov>=4.0.0
+
+# --- Optional executors / backends ---------------------------------------
+# Docker executor (`--docker` / `--docker-persistent`) and the full benchmark
+# harness, which runs tasks inside a persistent container.
+docker>=7.0.0
+
+# Anthropic backend (one of several optional LLM providers).
+anthropic>=0.20.0
