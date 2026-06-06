@@ -132,3 +132,65 @@ class TestImplementationOnlyExtraction:
         out = cg._extract_code(text)
         # `_test_value` does not start with `test_`, so it must survive.
         assert _defs(out) == {"_test_value", "compute"}
+
+    def test_solution_section_that_is_pure_tests_is_not_emitted(self, cg):
+        # Issue 1: a `# solution.py` section containing only tests must not be
+        # emitted verbatim; the real implementation from another section wins.
+        text = (
+            "```python\n"
+            "# solution.py\n"
+            "import pytest\n"
+            "def test_count():\n    assert count([1]) == 1\n\n"
+            "# helper.py\n"
+            "def count(items):\n    return len(items)\n"
+            "```"
+        )
+        out = cg._extract_code(text)
+        assert "count" in _defs(out)
+        assert "test_count" not in _defs(out)
+        assert "import pytest" not in out
+        ast.parse(out)
+
+    def test_impl_with_only_imports_and_dunder_main_plus_tests(self, cg):
+        # Issue 2: "real code" must include non-def/assign top-level statements
+        # (imports, module-level expr, `if __name__`). Embedded tests are still
+        # stripped even when the impl binds no top-level names via def/assign.
+        text = (
+            "```python\n"
+            "import sys\n"
+            "print('warming up')\n"
+            "if __name__ == '__main__':\n    sys.exit(0)\n\n"
+            "def test_x():\n    assert True\n"
+            "```"
+        )
+        out = cg._extract_code(text)
+        assert "test_x" not in out
+        assert "import sys" in out
+        assert "if __name__" in out
+        ast.parse(out)
+
+    def test_crlf_source_with_embedded_test_does_not_crash(self, cg):
+        # Issue 3: odd line bookkeeping (CRLF) must not raise; tests are stripped.
+        body = (
+            "def f(x):\r\n    return x + 1\r\n\r\n"
+            "def test_f():\r\n    assert f(1) == 2\r\n"
+        )
+        text = "```python\r\n" + body + "```"
+        out = cg._extract_code(text)
+        assert "f" in _defs(out)
+        assert "test_f" not in _defs(out)
+        ast.parse(out)
+
+    def test_requirements_only_response_does_not_crash(self, cg):
+        # Pathological: no implementation at all. Must not raise; output contains
+        # no real function definitions to mistake for an impl.
+        text = "```\n# requirements.txt\npytest==6.2.5\nrequests>=2\n```"
+        out = cg._extract_code(text)  # should not raise
+        assert "def " not in out
+
+    def test_tests_only_raw_text_falls_back_without_crashing(self, cg):
+        # No fences, no impl — only tests. We can't synthesize an impl, but the
+        # call must be graceful and never raise.
+        text = "from solution import f\n\ndef test_f():\n    assert f(0) == 0\n"
+        out = cg._extract_code(text)  # should not raise
+        assert isinstance(out, str)

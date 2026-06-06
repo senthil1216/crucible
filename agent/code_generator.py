@@ -7,7 +7,7 @@ import re
 from typing import Optional, Protocol
 
 from agent.models import Plan, CodeArtifact
-from agent.test_generator import MODULE_NAME
+from agent.test_generator import MODULE_NAME, is_test_module_path
 
 
 class LLMClient(Protocol):
@@ -460,42 +460,40 @@ my-cli --name Alice
         """
         blocks = re.findall(r'```(?:\w+)?\s*\n(.*?)\n```', text, re.DOTALL)
         candidates = [b.strip() for b in blocks] if blocks else [text.strip()]
-        chosen = self._select_implementation(candidates)
-        return self._strip_embedded_tests(chosen).strip()
+        return self._select_implementation(candidates).strip()
 
     def _select_implementation(self, candidates: list[str]) -> str:
         """Pick the implementation out of one or more candidate code chunks.
 
         Splits each chunk into `# filename`-delimited sections (with any leading
-        preamble as an unnamed section) and prefers, in order: the `solution`
-        module, then the first implementation-like `.py`/unnamed section that is
-        not a test file and not pure tests. Falls back to the first non-empty
-        candidate so behaviour is unchanged for plain single-impl responses.
+        preamble as an unnamed section), then considers them in priority order:
+        the `solution` module first, then other implementation-like sections
+        (unnamed, or a non-test `.py`). For each, embedded tests are stripped and
+        the result is accepted only if real implementation code remains — so a
+        section that is *only* tests (even one labelled `# solution.py`) is never
+        emitted. Falls back to the first non-empty candidate so plain
+        single-impl responses are unchanged.
         """
-        sections: list[tuple[Optional[str], str]] = []
+        primary: list[str] = []     # solution-named sections
+        secondary: list[str] = []   # other implementation-like sections
         for chunk in candidates:
-            secs = self._split_file_sections(chunk)
-            sections.extend(secs if secs else [(None, chunk)])
-
-        # 1) The exact solution-module section wins.
-        for name, content in sections:
-            if name == f"{MODULE_NAME}.py" and content.strip():
-                return content
-
-        # 2) First implementation-like section: a .py (or unnamed) chunk that is
-        #    neither a test file nor a non-Python data file nor pure tests.
-        for name, content in sections:
-            if not content.strip():
-                continue
-            if name is not None:
-                if not name.endswith(".py") or self._is_test_filename(name):
+            for name, content in (self._split_file_sections(chunk) or [(None, chunk)]):
+                if not content.strip():
                     continue
-            if self._looks_like_pure_tests(content):
-                continue
-            return content
+                if name == f"{MODULE_NAME}.py":
+                    primary.append(content)
+                elif name is None or (name.endswith(".py") and not is_test_module_path(name)):
+                    secondary.append(content)
+                # Named test files and non-Python data files (requirements.txt,
+                # etc.) are intentionally dropped.
 
-        # 3) Nothing looked like an implementation — return the first non-empty
-        #    candidate unchanged rather than dropping the model's output.
+        for content in primary + secondary:
+            impl = self._strip_embedded_tests(content)
+            if self._has_real_code(impl):
+                return impl
+
+        # Nothing looked like an implementation — return the first non-empty
+        # candidate unchanged rather than silently dropping the model's output.
         for chunk in candidates:
             if chunk.strip():
                 return chunk
@@ -522,16 +520,6 @@ my-cli --name Alice
         return sections
 
     @staticmethod
-    def _is_test_filename(name: str) -> bool:
-        base = name.rsplit("/", 1)[-1]
-        return (
-            base.startswith("test_")
-            or base.endswith("_test.py")
-            or base in ("tests.py", "test.py")
-            or "/tests/" in f"/{name}"
-        )
-
-    @staticmethod
     def _imports_pytest(node: ast.AST) -> bool:
         if isinstance(node, ast.Import):
             return any(a.name.split(".")[0] == "pytest" for a in node.names)
@@ -539,57 +527,57 @@ my-cli --name Alice
             return (node.module or "").split(".")[0] == "pytest"
         return False
 
-    def _looks_like_pure_tests(self, content: str) -> bool:
-        """True when a chunk is only tests (test_* funcs / Test* classes / pytest
-        imports) with no real implementation to keep."""
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
+    @classmethod
+    def _is_test_node(cls, node: ast.AST) -> bool:
+        """A top-level node that is part of a test suite, not the implementation."""
+        return (
+            (isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
+            or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+            or cls._imports_pytest(node)
+        )
+
+    def _has_real_code(self, src: str) -> bool:
+        """True if `src` has any top-level statement that is not a test node.
+
+        "Real" is defined broadly — anything that is not a `test_*`/`Test*`/pytest
+        node counts (imports, `if __name__`, module-level expressions, defs,
+        assignments). Unparsable but non-empty source is treated as real (we
+        can't prove it is tests-only). Empty source is not real.
+        """
+        if not src.strip():
             return False
-        has_test = has_real = False
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                has_test = True
-            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-                has_test = True
-            elif self._imports_pytest(node):
-                has_test = True
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                   ast.ClassDef, ast.Assign, ast.AnnAssign)):
-                has_real = True
-        return has_test and not has_real
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return True
+        return any(not self._is_test_node(node) for node in tree.body)
 
     def _strip_embedded_tests(self, src: str) -> str:
         """Remove top-level `test_*` functions, `Test*` classes, and `pytest`
         imports from an implementation — but only when real implementation code
-        remains, so a genuine impl is never nuked."""
+        remains, so a genuine impl is never nuked.
+
+        Defensive: any parsing/line-bookkeeping problem returns `src` unchanged
+        rather than failing the whole generation (the pre-fix fallback for
+        unparsable responses)."""
         try:
             tree = ast.parse(src)
-        except SyntaxError:
-            return src
-        lines = src.splitlines()
-        drop = [False] * (len(lines) + 2)  # 1-indexed, padded
-        removed = kept_real = False
-        for node in tree.body:
-            is_test = (
-                (isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
-                or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
-                or self._imports_pytest(node)
-            )
-            if is_test:
+            test_nodes = [n for n in tree.body if self._is_test_node(n)]
+            has_real = any(not self._is_test_node(n) for n in tree.body)
+            if not test_nodes or not has_real:
+                return src
+            lines = src.splitlines()
+            drop: set[int] = set()  # 1-indexed line numbers to remove
+            for node in test_nodes:
                 start = node.lineno
                 for dec in getattr(node, "decorator_list", []):
                     start = min(start, dec.lineno)
-                for ln in range(start, (node.end_lineno or node.lineno) + 1):
-                    drop[ln] = True
-                removed = True
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                   ast.ClassDef, ast.Assign, ast.AnnAssign)):
-                kept_real = True
-        if not removed or not kept_real:
+                end = node.end_lineno or node.lineno
+                drop.update(range(start, end + 1))
+            kept = [ln for i, ln in enumerate(lines, start=1) if i not in drop]
+            return "\n".join(kept).strip("\n")
+        except Exception:
             return src
-        out = [ln for i, ln in enumerate(lines, start=1) if not drop[i]]
-        return "\n".join(out).strip("\n")
     
     async def generate_fix(
         self,

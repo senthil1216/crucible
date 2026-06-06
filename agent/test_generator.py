@@ -14,6 +14,7 @@ implementation the tests should fail against).
 
 import ast
 import re
+from pathlib import Path
 from typing import List, Optional, Protocol, Tuple, Dict
 
 from agent.models import Plan, CodeArtifact
@@ -21,6 +22,25 @@ from agent.models import Plan, CodeArtifact
 
 MODULE_NAME = "solution"
 TEST_FILE_PATH = f"tests/test_{MODULE_NAME}.py"
+
+
+def is_test_module_path(rel_path: str) -> bool:
+    """True if a path/filename belongs to the test suite, not the implementation.
+
+    Single source of truth for the test-vs-implementation distinction, shared by
+    the executors (which separate impl from test files in a workspace) and the
+    code generator (which must not treat an LLM-supplied test file as the impl).
+    Recognises `tests/` packages, `test_*.py` / `*_test.py`, `conftest.py`, and
+    the bare `tests.py` / `test.py` names LLMs sometimes emit as file markers.
+    """
+    p = Path(rel_path)
+    name = p.name
+    return (
+        "tests" in p.parts
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name in ("conftest.py", "tests.py", "test.py")
+    )
 
 
 class LLMClient(Protocol):
