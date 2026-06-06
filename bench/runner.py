@@ -40,7 +40,8 @@ from agent.core import SelfImprovingAgent
 from agent.llm_clients import (
     OllamaClient, OpenAIClient, AnthropicClient, MockLLMClient,
 )
-from agent.models import AgentConfig, LoopConfig, IterationState
+from agent.models import AgentConfig, LoopConfig, IterationState, CodeArtifact
+from agent.test_generator import TEST_FILE_PATH
 
 from bench.problems import PROBLEMS, ProblemSpec
 
@@ -108,11 +109,31 @@ async def run_one(
               f"predictions={len(relevant_predictions)}")
         print(f"{'#' * 60}")
 
+    # Prefer the problem's hand-written golden oracle when present, so the run
+    # measures implementation quality against a trusted, correct suite instead
+    # of the LLM's (sometimes wrong) self-generated tests. Falls back to the
+    # agent's own test-first generation for problems without a golden suite.
+    frozen_tests = None
+    if problem.golden_test:
+        frozen_tests = CodeArtifact(
+            source=problem.golden_test,
+            file_path=TEST_FILE_PATH,
+            language="python",
+        )
+        if verbose:
+            print("# oracle: golden (hand-written)")
+    elif verbose:
+        print("# oracle: generated (agent test-first)")
+
     start = time.perf_counter()
     exc_text: Optional[str] = None
     state: Optional[IterationState] = None
     try:
-        state = await agent.solve(goal=problem.goal, task_id=f"{problem.id}-r{rep}")
+        state = await agent.solve(
+            goal=problem.goal,
+            task_id=f"{problem.id}-r{rep}",
+            frozen_tests=frozen_tests,
+        )
     except Exception:
         exc_text = traceback.format_exc()
     elapsed = time.perf_counter() - start

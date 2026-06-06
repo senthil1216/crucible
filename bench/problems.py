@@ -23,7 +23,7 @@ to surface (they are not fed in directly — the agent emits its own predictions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 # Keywords that signal a web/server/IO problem the benchmark must avoid.
@@ -40,6 +40,12 @@ class ProblemSpec:
     category: str                      # "string" | "list" | "dict" | "math" | "parsing"
     function_name: str                 # the single public entry point the goal implies
     adversarial_inputs: List[str] = field(default_factory=list)  # literals likely to trigger failures
+    # Hand-written "golden" pytest suite used as the benchmark's success oracle.
+    # When set, the runner freezes THIS suite instead of letting the agent write
+    # its own tests — so a run measures implementation quality against a trusted,
+    # correct oracle rather than the LLM's (sometimes wrong) generated tests.
+    # Must import from `solution` and live at tests/test_solution.py.
+    golden_test: Optional[str] = None
 
 
 def _g(fn: str, signature: str, behavior: str) -> str:
@@ -60,12 +66,40 @@ PROBLEMS: List[ProblemSpec] = [
             "Return the string with the order of whitespace-separated words reversed, "
             "collapsing runs of whitespace to a single space and stripping ends.",
         ), "string", "reverse_words", ["''", "'   '", "None"],
+        golden_test=(
+            "from solution import reverse_words\n\n\n"
+            "def test_basic():\n"
+            "    assert reverse_words('hello world') == 'world hello'\n\n\n"
+            "def test_collapse_runs_and_strip():\n"
+            "    assert reverse_words('  multiple   spaces  ') == 'spaces multiple'\n\n\n"
+            "def test_single_word():\n"
+            "    assert reverse_words('single') == 'single'\n\n\n"
+            "def test_tabs_and_newlines_are_whitespace():\n"
+            "    assert reverse_words('a\\tb\\nc') == 'c b a'\n\n\n"
+            "def test_empty():\n"
+            "    assert reverse_words('') == ''\n\n\n"
+            "def test_whitespace_only():\n"
+            "    assert reverse_words('    ') == ''\n"
+        ),
     ),
     ProblemSpec(
         "str-02-vowels", _g(
             "count_vowels", "count_vowels(s: str) -> int",
             "Return the number of vowels (a, e, i, o, u, case-insensitive) in the string.",
         ), "string", "count_vowels", ["''", "None", "'AEIOU'"],
+        golden_test=(
+            "from solution import count_vowels\n\n\n"
+            "def test_basic():\n"
+            "    assert count_vowels('hello world') == 3\n\n\n"
+            "def test_case_insensitive_all_vowels():\n"
+            "    assert count_vowels('AEIOUaeiou') == 10\n\n\n"
+            "def test_no_vowels():\n"
+            "    assert count_vowels('bcdfg BCDFG') == 0\n\n\n"
+            "def test_ignores_digits_and_punctuation():\n"
+            "    assert count_vowels('a1e2i3!o.u') == 5\n\n\n"
+            "def test_empty():\n"
+            "    assert count_vowels('') == 0\n"
+        ),
     ),
     ProblemSpec(
         "str-03-palindrome", _g(
@@ -73,6 +107,21 @@ PROBLEMS: List[ProblemSpec] = [
             "Return True if the string is a palindrome ignoring case and non-alphanumeric "
             "characters, else False.",
         ), "string", "is_palindrome", ["''", "None", "'A man a plan'"],
+        golden_test=(
+            "from solution import is_palindrome\n\n\n"
+            "def test_classic_phrase():\n"
+            "    assert is_palindrome('A man, a plan, a canal: Panama') is True\n\n\n"
+            "def test_not_a_palindrome():\n"
+            "    assert is_palindrome('race a car') is False\n\n\n"
+            "def test_ignores_case_and_punctuation():\n"
+            "    assert is_palindrome(\"No 'x' in Nixon\") is True\n\n\n"
+            "def test_digits():\n"
+            "    assert is_palindrome('12321') is True\n"
+            "    assert is_palindrome('12345') is False\n\n\n"
+            "def test_empty_and_single():\n"
+            "    assert is_palindrome('') is True\n"
+            "    assert is_palindrome('a') is True\n"
+        ),
     ),
     ProblemSpec(
         "str-04-first-unique", _g(
