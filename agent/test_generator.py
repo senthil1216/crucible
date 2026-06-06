@@ -39,6 +39,7 @@ Hard rules:
 - Import the things you test from that module, e.g. `from {MODULE_NAME} import my_function`.
 - Write a real pytest suite: top-level `def test_*` functions using plain `assert`
   (or `pytest.raises` for expected errors). Do NOT use a `unittest.TestCase` class.
+- If you use `pytest.raises` or any `pytest.*` API, include `import pytest`.
 - Each behaviour from the plan's test cases should become at least one assertion.
 - The tests must be specific enough that an empty/stub implementation FAILS them.
 - Every test MUST be satisfiable by a correct implementation. Do not assert on
@@ -189,6 +190,17 @@ def static_check_test_code(
     has_raises = "pytest.raises" in test_source or ".raises(" in test_source
     if not (has_assertion or has_raises):
         reasons.append("no `assert` or `pytest.raises` found")
+
+    imports_pytest = any(
+        isinstance(n, ast.Import) and any(a.name == "pytest" for a in n.names)
+        for n in ast.walk(tree)
+    )
+    references_pytest = any(
+        isinstance(n, ast.Name) and n.id == "pytest"
+        for n in ast.walk(tree)
+    )
+    if references_pytest and not imports_pytest:
+        reasons.append("references `pytest` but does not include `import pytest`")
 
     # Server-launch anti-patterns: a unit test must exercise the app via an
     # in-process client, never by starting the server as a process — those tests
