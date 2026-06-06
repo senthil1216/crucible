@@ -335,6 +335,7 @@ class SelfImprovingAgent:
                         relevant_learnings=relevant_learnings,
                         relevant_predictions=relevant_predictions,
                     )
+                self._enforce_single_function_contract(plan, goal)
 
             # Run the execution loop (reusing the memory-informed plan)
             final_state = await self.loop.run(
@@ -355,6 +356,25 @@ class SelfImprovingAgent:
         finally:
             # Guaranteed cleanup (critical for persistent Docker containers)
             await self._post_execution_cleanup(task_id)
+
+    @staticmethod
+    def _enforce_single_function_contract(plan: Optional[Plan], goal: str) -> None:
+        """Keep explicit single-function tasks on the frozen pytest path.
+
+        Benchmark problems intentionally ask for exactly one public function in
+        `solution.py`. Some models still mark those plans as multi-file, which
+        bypasses the frozen pytest gate and weakens the benchmark signal.
+        """
+        if plan is None:
+            return
+        text = goal.lower()
+        if (
+            "single python function" in text
+            and "exactly one public function" in text
+        ):
+            plan.use_multi_file = False
+            if plan.project_type != "general":
+                plan.project_type = "general"
 
     async def _post_execution_cleanup(self, task_id: str) -> None:
         """Central place for all end-of-task cleanup (especially Docker)."""
