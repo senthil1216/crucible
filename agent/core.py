@@ -241,16 +241,20 @@ class SelfImprovingAgent:
         self,
         goal: str,
         task_id: Optional[str] = None,
-        resume: bool = False
+        resume: bool = False,
+        frozen_tests: Optional[CodeArtifact] = None,
     ) -> IterationState:
         """
         Solve a coding task autonomously.
-        
+
         Args:
             goal: Description of the coding task
             task_id: Optional task identifier (generated if not provided)
             resume: Whether to resume from a previous checkpoint
-        
+            frozen_tests: Optional caller-supplied frozen pytest suite. When given,
+                the loop gates on it instead of generating its own tests (used by
+                the benchmark to supply a hand-written golden oracle).
+
         Returns:
             Final iteration state
         """
@@ -343,6 +347,7 @@ class SelfImprovingAgent:
                 task_id=task_id,
                 resume_from=resume_from,
                 plan=plan,
+                frozen_tests=frozen_tests,
             )
 
             # Post-execution processing

@@ -68,9 +68,11 @@ class FakeAgent:
         self.long_term_memory = FakeLongTermMemory()
         self.prediction_memory = FakePredictionMemory()
         self.solve_calls = []
+        self.frozen_tests_seen = []
 
-    async def solve(self, goal, task_id=None):
+    async def solve(self, goal, task_id=None, frozen_tests=None):
         self.solve_calls.append((goal, task_id))
+        self.frozen_tests_seen.append(frozen_tests)
         return FakeState(
             iteration=2,
             status=Status.SUCCESS,
@@ -115,6 +117,35 @@ async def test_one_record_per_problem_rep(tmp_path):
     assert len(lines) == 12
     for line in lines:
         json.loads(line)                    # every line is valid JSON
+
+
+@pytest.mark.asyncio
+async def test_golden_test_is_injected_as_frozen_suite(tmp_path):
+    # A problem carrying a golden suite must have it passed to solve() as a
+    # frozen CodeArtifact; a problem without one passes frozen_tests=None.
+    agent = FakeAgent()
+    out = tmp_path / "out.jsonl"
+    golden = "from solution import f\n\ndef test_f():\n    assert f(1) == 1\n"
+    problems = [
+        ProblemSpec(
+            id="p-golden", goal="do thing via f", category="list",
+            function_name="f", adversarial_inputs=["[]"], golden_test=golden,
+        ),
+        ProblemSpec(
+            id="p-plain", goal="do other via g", category="list",
+            function_name="g", adversarial_inputs=["[]"],
+        ),
+    ]
+    await bench_runner.run_batch(agent, problems, reps=1, out_path=out, verbose=False)
+
+    seen = {tid: ft for (_, tid), ft in zip(agent.solve_calls, agent.frozen_tests_seen)}
+    golden_artifact = next(ft for tid, ft in seen.items() if tid.startswith("p-golden"))
+    plain_artifact = next(ft for tid, ft in seen.items() if tid.startswith("p-plain"))
+    assert golden_artifact is not None
+    assert golden_artifact.source == golden
+    assert golden_artifact.file_path == "tests/test_solution.py"
+    # The plain problem gets no injected suite (agent generates its own).
+    assert plain_artifact is None
 
 
 @pytest.mark.asyncio

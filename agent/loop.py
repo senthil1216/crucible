@@ -175,10 +175,11 @@ class ExecutionLoop:
         task_id: Optional[str] = None,
         resume_from: Optional[IterationState] = None,
         plan: Optional[Plan] = None,
+        frozen_tests: Optional[CodeArtifact] = None,
     ) -> IterationState:
         """
         Run the execution loop until success, failure, or max iterations.
-        
+
         Args:
             goal: The coding task to accomplish
             task_id: Optional identifier for this task
@@ -186,6 +187,12 @@ class ExecutionLoop:
             plan: Optional pre-computed plan. When the caller already planned
                 (e.g. core, using long-term memory), pass it here so the loop
                 reuses it instead of making a second, memory-blind plan call.
+            frozen_tests: Optional caller-supplied frozen pytest suite. When given
+                (e.g. the benchmark's hand-written golden oracle), the loop skips
+                test generation and gates on this suite instead. The agent then
+                only has to produce a correct implementation, so success measures
+                implementation quality against a trusted oracle rather than the
+                agent's ability to write its own (sometimes wrong) tests.
 
         Returns:
             Final iteration state
@@ -216,7 +223,8 @@ class ExecutionLoop:
             print(f"Tests: {len(current_plan.test_cases)}")
             if self.on_plan:
                 self.on_plan(current_plan)
-            frozen_tests = None
+            # `frozen_tests` flows through from the caller (e.g. the benchmark
+            # golden oracle). When None, it is generated test-first below.
             iteration = 1
 
         # Eager dependency install (Docker persistent path only). The plan already
@@ -228,6 +236,26 @@ class ExecutionLoop:
         install_task = None
         if self.dependency_manager and not resume_from:
             install_task = asyncio.create_task(self._eager_install(current_plan))
+
+        # Caller-supplied frozen suite (e.g. benchmark golden oracle): trust it,
+        # but sanity-check structure so a malformed suite fails loudly instead of
+        # silently mis-gating. No generation, no vacuity stub run.
+        if (
+            frozen_tests is not None
+            and not resume_from
+            and self._pytest_gate_enabled(current_plan)
+        ):
+            ok, reasons = static_check_test_code(frozen_tests.source, MODULE_NAME)
+            if not ok:
+                return self._gate_failure_state(
+                    current_plan, goal, task_id,
+                    "Injected frozen test suite is structurally invalid: "
+                    + "; ".join(reasons),
+                )
+            print(
+                f"\n[TESTS] Using caller-supplied frozen suite: "
+                f"{frozen_tests.file_path}"
+            )
 
         # Test-first: generate and validate the frozen pytest suite once. The
         # suite is reused unchanged across fix iterations.
