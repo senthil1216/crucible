@@ -69,7 +69,179 @@ Crucible provides value by making coding-agent improvement inspectable:
 
 The core value is not just code generation. The core value is measured feedback.
 
-## Phase 1: Stabilize The Foundation
+## Concrete Execution Plan
+
+Last updated: June 6, 2026.
+
+### Current Status
+
+The foundation is now strong enough to move from mechanism-building to evidence:
+
+- `pytest -q` is green on `main`.
+- Docker/Colima and Ollama smoke runs have been exercised locally.
+- Dependency recovery is hardened:
+  - pip install failures are categorized.
+  - requirements-file install support exists.
+  - stdlib and test-runner dependencies are filtered before eager install.
+  - successful dependency installs are persisted into pattern environment context.
+- The benchmark smoke harness is stabilized:
+  - circuit-breaker state resets per task while memory persists across the run.
+  - previous-task code no longer leaks into new-task summaries.
+  - pytest failure detail is passed to reflection.
+  - generated tests that use `pytest` must import it.
+  - explicit single-function tasks stay on the frozen single-file pytest path.
+
+The next milestone is not another large feature. The next milestone is a real,
+credible calibration report.
+
+The milestones below are the active near-term execution plan. The broader
+Phase 1-9 roadmap remains as long-term product context and should not be read as
+the immediate task queue.
+
+### Milestone 1: Clean Benchmark Smoke
+
+Goal: prove the benchmark harness is valid before spending time on a full run.
+
+First run the deterministic offline harness smoke. This is for pipeline
+validity only; it is not a model-quality or calibration result:
+
+```bash
+rm -rf .agent_memory
+python -m bench.runner --smoke --llm mock --no-docker --quiet
+```
+
+Then run a real local smoke with Docker and Ollama to inspect replay and
+off-topic behavior:
+
+```bash
+rm -rf .agent_memory
+python -m bench.runner --smoke --model qwen2.5-coder:7b
+RUN_JSONL="$(ls -t bench/results/bench_*.jsonl | head -1)"
+python -m bench.analyze "$RUN_JSONL" \
+  --predictions .agent_memory/predictions/predictions.jsonl \
+  --out bench/REPORT.smoke.md
+```
+
+Acceptance criteria:
+
+- All smoke tasks use the frozen single-file pytest path.
+- No benchmark task falls back to legacy multi-file execution.
+- No eager install attempts for stdlib modules such as `re`, `json`, or `pathlib`.
+- No eager install attempts for test-runner-only packages such as `pytest`.
+- No cross-task circuit-breaker carryover.
+- Replay runs when failures are fixed.
+- Off-topic replay verdicts are explained and investigated, not hidden.
+
+The frozen-pytest and legacy-path checks are currently manual log/artifact
+audits. A small follow-up should add explicit harness-path metadata to benchmark
+JSONL records so this gate can be checked mechanically.
+
+If this fails, fix only benchmark validity issues. Do not broaden the benchmark
+or publish results until this gate is clean.
+
+### Milestone 2: Improve Replay Signal
+
+Goal: make calibration meaningful, not just make tasks pass.
+
+Work items:
+
+- Inspect every off-topic replay verdict from the clean smoke run.
+- Fix entry-point selection for single-function tasks if the final code contains
+  wrappers, helper functions, or module-name drift.
+- Avoid storing predictions about harness failures such as missing generated
+  files, missing test modules, or Docker path rejection unless those are being
+  explicitly measured.
+- Add tests for any replay failure mode found in smoke.
+
+Acceptance criteria:
+
+- Smoke still passes.
+- Replay verdicts are mostly applicable to the task function, not the harness.
+- `bench.analyze` produces non-empty calibration buckets when predictions are
+  emitted.
+
+### Milestone 3: Full Local Benchmark Run
+
+Goal: produce the first real evidence set.
+
+Use one fixed model for the headline run:
+
+```bash
+rm -rf .agent_memory
+python -m bench.runner --reps 5 --model qwen2.5-coder:7b
+RUN_JSONL="$(ls -t bench/results/bench_*.jsonl | head -1)"
+python -m bench.analyze "$RUN_JSONL" \
+  --predictions .agent_memory/predictions/predictions.jsonl \
+  --out bench/REPORT.md
+```
+
+Acceptance criteria:
+
+- The run uses a single fixed model.
+- The exact command and model are noted in the published report or PR
+  description until runner metadata records them automatically.
+- Memory is not reset mid-run.
+- The report includes both successes and failures.
+- `bench/REPORT.md` is generated from real run data, not synthetic data.
+- The report names any benchmark limitations directly.
+
+### Milestone 4: Report Review And Benchmark Fixes
+
+Goal: make the report credible enough to publish or discuss.
+
+Review:
+
+- Task success rate.
+- Iterations to success.
+- Prediction counts.
+- Confirmed, falsified, and off-topic replay counts.
+- Confidence calibration by bucket.
+- Top off-topic causes.
+- Tasks where memory appeared helpful.
+- Tasks where memory did not help or made behavior worse.
+
+Fix only issues that affect measurement integrity:
+
+- malformed predictions,
+- replay entry-point mistakes,
+- test-generation invalidity,
+- task definitions that allow ambiguous public APIs,
+- missing benchmark metadata.
+
+Do not tune tasks to inflate success rate.
+
+### Milestone 5: Canonical Demo
+
+Goal: create a short demo that shows the thesis without requiring a full
+benchmark run.
+
+Demo sequence:
+
+```text
+failure -> prediction -> fix -> replay -> calibration signal
+```
+
+Deliverables:
+
+- one command that runs the demo,
+- a README section explaining the sequence,
+- saved output or a short recording showing the replay verdict.
+
+### Milestone 6: Publishable Package
+
+Goal: make the project understandable to someone who did not follow development.
+
+Deliverables:
+
+- updated README centered on testable memory,
+- real `bench/REPORT.md`,
+- canonical demo,
+- concise limitations section,
+- Medium/LinkedIn draft grounded in the actual report.
+
+Do not publish a claim stronger than the data supports.
+
+## Phase 1: Stabilize The Foundation (Done)
 
 Goal: make the repository reliably runnable by a new user.
 
