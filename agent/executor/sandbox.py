@@ -18,7 +18,6 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
-import threading
 import time
 
 from agent.models import CodeArtifact, TestResults, AgentConfig
@@ -122,8 +121,10 @@ class SandboxedExecutor:
 
         `files` maps relative paths (e.g. "solution.py",
         "tests/test_solution.py") to their contents. Returns a TestResults
-        built from the pytest JSON report — `passed` is true only if pytest
-        collected at least one test and none failed.
+        built from the richest available machine-readable pytest report
+        (pytest-json-report JSON when the plugin is present; otherwise
+        pytest's built-in JUnit XML fallback). `passed` is true only if
+        pytest collected >= 1 test and none failed (or errored).
         """
         impl_blob = "\n\n".join(
             src for path, src in files.items() if not _is_test_path(path)
