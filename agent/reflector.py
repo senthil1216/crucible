@@ -220,7 +220,7 @@ If no useful prediction can be made, return {"predictions": []}."""
     def _extract_error_signature(self, results: TestResults) -> ErrorSignature:
         """Extract normalized error signature from test results."""
         error_type = results.error_type or "UnknownError"
-        error_message = results.stderr[:500] if results.stderr else ""
+        error_message = self._failure_detail(results, limit=1200)
         
         # Try to extract line number
         line_number = None
@@ -242,6 +242,28 @@ If no useful prediction can be made, return {"predictions": []}."""
             error_message=error_message,
             line_number=line_number
         )
+
+    @staticmethod
+    def _failure_detail(results: TestResults, limit: int = 1200) -> str:
+        """Return the most actionable failure text available.
+
+        For pytest assertion failures, stderr is often empty while the parsed
+        per-test failure messages contain the expected/actual mismatch. That
+        detail should drive reflection and fix generation.
+        """
+        parts = []
+        for failure in (results.test_failures or [])[:4]:
+            nodeid = failure.get("nodeid") or "?"
+            outcome = failure.get("outcome") or "failed"
+            message = failure.get("message") or ""
+            if message:
+                parts.append(f"{nodeid} ({outcome}):\n{message}")
+        if results.stderr:
+            parts.append(results.stderr)
+        if results.stdout:
+            parts.append(results.stdout)
+        detail = "\n\n".join(parts)
+        return detail[:limit] if detail else ""
     
     def _build_analysis_prompt(
         self,
@@ -276,6 +298,14 @@ If no useful prediction can be made, return {"predictions": []}."""
             "Standard Error:",
             test_results.stderr[:1000] if test_results.stderr else "(empty)",
         ]
+
+        failure_detail = self._failure_detail(test_results, limit=2000)
+        if failure_detail:
+            lines.extend([
+                "",
+                "Most Actionable Failure Detail:",
+                failure_detail,
+            ])
 
         # When the result came from a real pytest run, the per-test failures are
         # far more actionable than the raw streams — surface them explicitly.
@@ -515,4 +545,3 @@ If no useful prediction can be made, return {"predictions": []}."""
             if pred.is_well_formed():
                 predictions.append(pred)
         return predictions
-

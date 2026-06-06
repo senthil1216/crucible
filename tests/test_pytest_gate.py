@@ -46,6 +46,27 @@ class TestAppLaunchHelpers:
         from agent.core import SelfImprovingAgent
         assert SelfImprovingAgent._detect_fastapi_app_var("def f(): pass") == "app"
 
+    def test_single_function_contract_forces_single_file_plan(self):
+        from agent.core import SelfImprovingAgent
+        from agent.models import Plan
+
+        plan = Plan(
+            goal="x",
+            steps=[],
+            test_cases=[],
+            project_type="python_package",
+            use_multi_file=True,
+        )
+        goal = (
+            "Write a single Python function is_palindrome(s: str) -> bool. "
+            "Define exactly one public function named `is_palindrome`."
+        )
+
+        SelfImprovingAgent._enforce_single_function_contract(plan, goal)
+
+        assert plan.use_multi_file is False
+        assert plan.project_type == "general"
+
 
 class TestReportParser:
     def test_all_pass(self):
@@ -151,6 +172,17 @@ class TestVacuityHelpers:
         ok, reasons = static_check_test_code(src)
         assert ok is False
         assert any("assert" in r for r in reasons)
+
+    def test_static_check_rejects_pytest_reference_without_import(self):
+        src = (
+            "from solution import parse\n\n"
+            "def test_none():\n"
+            "    with pytest.raises(TypeError):\n"
+            "        parse(None)\n"
+        )
+        ok, reasons = static_check_test_code(src)
+        assert ok is False
+        assert any("import pytest" in r for r in reasons)
 
     def test_static_check_rejects_syntax_error(self):
         ok, reasons = static_check_test_code("def test(:\n  pass")
@@ -407,6 +439,32 @@ class TestLoopGate:
         result = await loop.run("add two numbers", task_id="t-eager")
 
         assert dep.installed == ["fastapi"]   # installed eagerly, up front
+        assert result.status == Status.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_eager_install_skips_stdlib_dependencies(self):
+        # LLM plans can confuse imports with pip packages. Stdlib modules should
+        # not be sent to pip, but real package specs should be preserved.
+        plan_with_deps = json.dumps({
+            "steps": ["implement it"],
+            "test_cases": ["it works"],
+            "language": "python",
+            "dependencies": [
+                "re", "json", "pathlib", "pytest", "fastapi", "uvicorn[standard]"
+            ],
+            "project_type": "general",
+            "use_multi_file": False,
+        })
+        llm = ScriptedLLM(
+            impl_source="def add(a, b):\n    return a + b\n",
+            test_source=ADD_TESTS,
+            plan_json=plan_with_deps,
+        )
+        dep = FakeDepManager()
+        loop, _ = _build_loop(llm, dependency_manager=dep)
+        result = await loop.run("add two numbers", task_id="t-eager-stdlib")
+
+        assert dep.installed == ["fastapi", "uvicorn[standard]"]
         assert result.status == Status.SUCCESS
 
     @pytest.mark.asyncio

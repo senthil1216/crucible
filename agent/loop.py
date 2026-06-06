@@ -4,6 +4,8 @@ Includes circuit breaker pattern and state persistence.
 """
 
 import asyncio
+import re
+import sys
 import time
 from typing import List, Optional, Callable
 from dataclasses import dataclass
@@ -188,6 +190,11 @@ class ExecutionLoop:
         Returns:
             Final iteration state
         """
+        if not resume_from:
+            # A loop instance is reused across benchmark tasks. Memory should
+            # persist between tasks, but circuit-breaker state is per task.
+            self.circuit_breaker.close()
+
         # Initialize or restore state
         if resume_from:
             current_plan = resume_from.plan
@@ -247,21 +254,25 @@ class ExecutionLoop:
         # that on success we can replay all of their predictions against the
         # final code. Reset per run() — this loop instance is reused across tasks.
         emitted_failure_ids: List[str] = []
+        task_states: List[IterationState] = []
 
         while iteration <= self.config.max_iterations:
             # Check circuit breaker
             if not self.circuit_breaker.can_execute():
                 print(f"⚠️ Circuit breaker is {self.circuit_breaker.get_state()}")
 
-                # Try to surface the last real code attempt instead of an empty artifact.
-                # This makes the final summary and persisted file much more useful.
-                last_states = self.memory.get_recent(1)
-                if last_states:
-                    last = last_states[0]
+                # Surface only this task's last code attempt. The loop's memory
+                # persists across benchmark tasks, so reading from global short
+                # term memory here would leak a previous task's code into this
+                # task's summary.
+                if task_states:
+                    last = task_states[-1]
                     code_to_use = last.code
                     plan_to_use = last.plan
                 else:
-                    code_to_use = CodeArtifact(source="", file_path="", language="python")
+                    code_to_use = CodeArtifact(
+                        source="", file_path=f"{MODULE_NAME}.py", language="python"
+                    )
                     plan_to_use = current_plan or Plan(goal=goal, steps=[], test_cases=[])
 
                 return self._create_final_state(
@@ -301,6 +312,7 @@ class ExecutionLoop:
                 
                 # Store in memory
                 self.memory.add(state)
+                task_states.append(state)
                 
                 # Record result for circuit breaker
                 self.circuit_breaker.record_result(state.status == Status.SUCCESS)
@@ -422,7 +434,8 @@ class ExecutionLoop:
         """
         if not self.dependency_manager:
             return
-        deps = list(getattr(plan, "dependencies", None) or [])
+        raw_deps = list(getattr(plan, "dependencies", None) or [])
+        deps = self._pip_installable_dependencies(raw_deps)
         if not deps:
             return
         print(f"[DEPS] Pre-installing declared dependencies: {deps}")
@@ -441,6 +454,55 @@ class ExecutionLoop:
                 f"[DEPS] Pre-install incomplete: {getattr(result, 'stderr', '')} "
                 "— relying on reactive recovery"
             )
+
+    @staticmethod
+    def _pip_installable_dependencies(dependencies: List[str]) -> List[str]:
+        """Return declared dependencies that are plausible pip requirements.
+
+        Plans sometimes list imported stdlib modules such as `re` as
+        dependencies. Eager install is best-effort, but attempting to pip install
+        stdlib modules adds noise and can consume benchmark time.
+        """
+        installable: List[str] = []
+        seen = set()
+        for dep in dependencies:
+            if not dep or not str(dep).strip():
+                continue
+            dep_text = str(dep).strip()
+            import_name = ExecutionLoop._requirement_import_name(dep_text)
+            if (
+                import_name
+                and (
+                    ExecutionLoop._is_stdlib_name(import_name)
+                    or ExecutionLoop._is_test_only_dependency(import_name)
+                )
+            ):
+                continue
+            key = dep_text.lower()
+            if key not in seen:
+                seen.add(key)
+                installable.append(dep_text)
+        return installable
+
+    @staticmethod
+    def _requirement_import_name(requirement: str) -> str:
+        """Extract the leading import-like name from a pip requirement string."""
+        name = re.split(r"\s*(?:\[|==|~=|!=|<=|>=|<|>|;)", requirement, maxsplit=1)[0]
+        return name.strip().replace("-", "_").split(".")[0].lower()
+
+    @staticmethod
+    def _is_stdlib_name(name: str) -> bool:
+        if not name:
+            return False
+        if name in sys.builtin_module_names:
+            return True
+        stdlib = getattr(sys, "stdlib_module_names", set())
+        return name in stdlib
+
+    @staticmethod
+    def _is_test_only_dependency(name: str) -> bool:
+        """Dependencies provided by the test runner, not the generated app."""
+        return name in {"pytest", "pytest_jsonreport", "pytest_json_report"}
 
     def _pytest_gate_enabled(self, plan: Plan) -> bool:
         """
@@ -581,8 +643,8 @@ class ExecutionLoop:
     ) -> IterationState:
         """One iteration gated on the frozen pytest suite (single-file Python)."""
         print("\n[EXECUTE] Generating implementation...")
-        previous_code = self.memory.get_last_code()
-        last_reflection = self.memory.get_last_reflection()
+        previous_code = self.memory.get_last_code() if iteration > 1 else None
+        last_reflection = self.memory.get_last_reflection() if iteration > 1 else None
 
         is_fix = bool(previous_code and last_reflection and not last_reflection.success)
         with self.profiler.track("code_generation"):

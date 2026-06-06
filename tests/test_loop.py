@@ -179,3 +179,30 @@ class TestExecutionLoop:
         
         # Should stop due to circuit breaker
         assert result.status == Status.CIRCUIT_BREAKER
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_resets_for_new_task(self):
+        memory = ShortTermMemory()
+        tester = MockTester(should_pass=False)
+        loop = ExecutionLoop(
+            planner=MockPlanner(),
+            code_generator=MockCodeGenerator(),
+            tester=tester,
+            reflector=MockReflector(should_continue=True),
+            short_term_memory=memory,
+            config=LoopConfig(
+                max_iterations=10,
+                failure_threshold=2,
+                failure_window=3,
+            )
+        )
+
+        first = await loop.run("failing task")
+        assert first.status == Status.CIRCUIT_BREAKER
+        assert loop.circuit_breaker.get_state() == "OPEN"
+
+        tester.should_pass = True
+        second = await loop.run("independent passing task")
+
+        assert second.status == Status.SUCCESS
+        assert loop.circuit_breaker.get_state() == "CLOSED"

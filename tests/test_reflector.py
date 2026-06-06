@@ -5,7 +5,7 @@ Tests for the Reflector.
 import pytest
 
 from agent.reflector import Reflector
-from agent.models import Plan, CodeArtifact
+from agent.models import Plan, CodeArtifact, TestResults
 
 
 class StubLearningLLM:
@@ -77,3 +77,43 @@ async def test_extract_learnings_caps_at_three():
 
     learnings = await reflector.extract_learnings(plan=plan, code=code)
     assert len(learnings) == 3
+
+
+@pytest.mark.asyncio
+async def test_pytest_failure_detail_drives_reflection_prompt_and_signature():
+    llm = StubLearningLLM(
+        '{"success": false, "analysis": "off by one", '
+        '"root_cause": "wrong boundary", "suggested_fix": "return x + 1", '
+        '"should_continue": true, "confidence": 0.8}'
+    )
+    reflector = Reflector(llm=llm)
+    results = TestResults(
+        passed=False,
+        stdout="",
+        stderr="",
+        error_type="AssertionError",
+        tests_collected=1,
+        tests_failed=1,
+        test_failures=[{
+            "nodeid": "tests/test_solution.py::test_inc",
+            "outcome": "failed",
+            "message": "assert 1 == 2\n + where 1 = inc(0)",
+        }],
+        from_pytest=True,
+    )
+
+    reflection = await reflector.analyze(
+        test_results=results,
+        code=CodeArtifact(
+            source="def inc(x):\n    return x\n",
+            file_path="solution.py",
+            language="python",
+        ),
+        plan=Plan(goal="increment", steps=[], test_cases=[]),
+        iteration=1,
+    )
+
+    assert reflection.error_signature.error_message
+    assert "assert 1 == 2" in reflection.error_signature.error_message
+    assert "Most Actionable Failure Detail" in llm.last_prompt
+    assert "tests/test_solution.py::test_inc" in llm.last_prompt
