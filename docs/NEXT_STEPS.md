@@ -94,16 +94,30 @@ The foundation is now strong enough to move from mechanism-building to evidence:
 The next milestone is not another large feature. The next milestone is a real,
 credible calibration report.
 
+The milestones below are the active near-term execution plan. The broader
+Phase 1-9 roadmap remains as long-term product context and should not be read as
+the immediate task queue.
+
 ### Milestone 1: Clean Benchmark Smoke
 
 Goal: prove the benchmark harness is valid before spending time on a full run.
 
-Run from a clean memory directory:
+First run the deterministic offline harness smoke. This is for pipeline
+validity only; it is not a model-quality or calibration result:
 
 ```bash
 rm -rf .agent_memory
-python -m bench.runner --smoke
-python -m bench.analyze bench/results/<run>.jsonl \
+python -m bench.runner --smoke --llm mock --no-docker --quiet
+```
+
+Then run a real local smoke with Docker and Ollama to inspect replay and
+off-topic behavior:
+
+```bash
+rm -rf .agent_memory
+python -m bench.runner --smoke --model qwen2.5-coder:7b
+RUN_JSONL="$(ls -t bench/results/bench_*.jsonl | head -1)"
+python -m bench.analyze "$RUN_JSONL" \
   --predictions .agent_memory/predictions/predictions.jsonl \
   --out bench/REPORT.smoke.md
 ```
@@ -117,6 +131,10 @@ Acceptance criteria:
 - No cross-task circuit-breaker carryover.
 - Replay runs when failures are fixed.
 - Off-topic replay verdicts are explained and investigated, not hidden.
+
+The frozen-pytest and legacy-path checks are currently manual log/artifact
+audits. A small follow-up should add explicit harness-path metadata to benchmark
+JSONL records so this gate can be checked mechanically.
 
 If this fails, fix only benchmark validity issues. Do not broaden the benchmark
 or publish results until this gate is clean.
@@ -151,14 +169,17 @@ Use one fixed model for the headline run:
 ```bash
 rm -rf .agent_memory
 python -m bench.runner --reps 5 --model qwen2.5-coder:7b
-python -m bench.analyze bench/results/<run>.jsonl \
+RUN_JSONL="$(ls -t bench/results/bench_*.jsonl | head -1)"
+python -m bench.analyze "$RUN_JSONL" \
   --predictions .agent_memory/predictions/predictions.jsonl \
   --out bench/REPORT.md
 ```
 
 Acceptance criteria:
 
-- The run uses a single fixed model and records the command used.
+- The run uses a single fixed model.
+- The exact command and model are noted in the published report or PR
+  description until runner metadata records them automatically.
 - Memory is not reset mid-run.
 - The report includes both successes and failures.
 - `bench/REPORT.md` is generated from real run data, not synthetic data.
@@ -220,7 +241,7 @@ Deliverables:
 
 Do not publish a claim stronger than the data supports.
 
-## Phase 1: Stabilize The Foundation
+## Phase 1: Stabilize The Foundation (Done)
 
 Goal: make the repository reliably runnable by a new user.
 
