@@ -107,6 +107,24 @@ class TestReportParser:
         assert r.tests_errors >= 1
         assert r.error_type == "ImportError"
 
+    def test_skipped_counts_toward_collected(self):
+        # Mirrors the JUnit-side tests: skipped tests contribute to `collected`
+        # (so an all-skipped suite is not "NoTestsCollected") but do not count
+        # toward passed/failed. This ensures the "identical success rule" claim
+        # holds for the JSON path as well.
+        report = json.dumps({
+            "summary": {"passed": 1, "skipped": 1, "total": 2, "collected": 2},
+            "tests": [
+                {"nodeid": "t::test_a", "outcome": "passed"},
+                {"nodeid": "t::test_b", "outcome": "skipped"},
+            ],
+        })
+        r = build_test_results(report, "", "", 0)
+        assert r.passed is True
+        assert r.tests_collected == 2
+        assert r.tests_passed == 1
+        assert r.tests_failed == 0
+
 
 # ---------------------------------------------------------------------------
 # 2. Vacuity helpers.

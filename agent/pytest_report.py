@@ -1,17 +1,25 @@
 """
-Parse pytest-json-report output into a TestResults.
+Pytest report parsing for the agent's success gate, with no-plugin fallback.
 
-This is the bridge that makes "passed" mean "a real pytest suite actually
-passed" rather than "the script exited 0". The single source of truth for the
-success rule lives in `build_test_results`:
+Executors use `build_test_results_preferring_json` (the public entry point):
+
+- Prefers the rich output from the `pytest-json-report` plugin when available
+  (via `json_report_available()`).
+- Falls back to parsing pytest's built-in JUnit XML reporter
+  (`build_test_results_from_junit`) when the plugin is absent.
+- Both the JSON and JUnit paths implement the *identical* success rule
+  (so the gate behaves the same on a clean install with no extra packages):
 
     passed == (tests_collected > 0
                and tests_failed == 0
                and tests_errors == 0
-               and no collection errors)
+               and collection_errors == 0)
 
-An empty suite (tests_collected == 0) is never a pass — that is the exact
-failure mode the old exit-code gate allowed.
+`build_test_results` is the internal JSON-only parser (kept for the preferring
+dispatcher and direct use).
+
+An empty or hollow suite is never treated as success — that is the key
+property this module exists to enforce (unlike the old "exit code == 0" gate).
 """
 
 import json
@@ -71,6 +79,72 @@ def _longrepr_text(node: Dict[str, Any]) -> str:
         lr = node["longrepr"]
         return lr if isinstance(lr, str) else str(lr)
     return ""
+
+
+def _apply_success_rule(
+    tests_collected: int,
+    tests_failed: int,
+    test_errors: int,
+    collection_errors: int,
+    test_failures: List[Dict[str, Any]],
+    stderr: str,
+) -> tuple[bool, Optional[str]]:
+    """Apply the canonical success rule and derive error_type.
+
+    This is the single source of truth for:
+
+        passed == (tests_collected > 0 and no failures and no errors and no collection errors)
+
+    Used by both the JSON and JUnit parsers so the gate is identical either way.
+    """
+    passed = (
+        tests_collected > 0
+        and tests_failed == 0
+        and test_errors == 0
+        and collection_errors == 0
+    )
+
+    error_type: Optional[str] = None
+    if not passed:
+        if tests_collected == 0 and collection_errors == 0:
+            error_type = "NoTestsCollected"
+        else:
+            blob = "\n".join(f.get("message", "") for f in test_failures) + "\n" + stderr
+            error_type = classify_error(blob) or "TestFailure"
+
+    return passed, error_type
+
+
+def _build_test_results(
+    passed: bool,
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    execution_time: float,
+    error_type: Optional[str],
+    failed_names: List[str],
+    tests_collected: int,
+    tests_passed: int,
+    tests_failed: int,
+    tests_errors: int,
+    test_failures: List[Dict[str, Any]],
+) -> TestResults:
+    """Common TestResults constructor (ensures identical shape from either parser)."""
+    return TestResults(
+        passed=passed,
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        execution_time=execution_time,
+        error_type=error_type,
+        failed_tests=failed_names,
+        tests_collected=tests_collected,
+        tests_passed=tests_passed,
+        tests_failed=tests_failed,
+        tests_errors=tests_errors,
+        test_failures=test_failures,
+        from_pytest=True,
+    )
 
 
 def parse_report(report_text: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -156,36 +230,28 @@ def build_test_results(
                 "message": _longrepr_text(node)[:1500],
             })
 
-    passed = (
-        tests_collected > 0
-        and tests_failed == 0
-        and tests_errors == 0
-        and collection_errors == 0
+    passed, error_type = _apply_success_rule(
+        tests_collected=tests_collected,
+        tests_failed=tests_failed,
+        test_errors=tests_errors,
+        collection_errors=collection_errors,
+        test_failures=test_failures,
+        stderr=stderr,
     )
 
-    # Classify a representative error for the Reflector / dependency recovery.
-    error_type = None
-    if not passed:
-        if tests_collected == 0 and collection_errors == 0:
-            error_type = "NoTestsCollected"
-        else:
-            blob = "\n".join(f.get("message", "") for f in test_failures) + "\n" + stderr
-            error_type = classify_error(blob) or "TestFailure"
-
-    return TestResults(
+    return _build_test_results(
         passed=passed,
         stdout=stdout,
         stderr=stderr,
         exit_code=exit_code,
         execution_time=execution_time,
         error_type=error_type,
-        failed_tests=failed_names,
+        failed_names=failed_names,
         tests_collected=tests_collected,
         tests_passed=tests_passed,
         tests_failed=tests_failed,
         tests_errors=tests_errors + collection_errors,
         test_failures=test_failures,
-        from_pytest=True,
     )
 
 
@@ -292,35 +358,28 @@ def build_test_results_from_junit(
     # gated identically regardless of plugin availability.
     tests_collected = tests_passed + tests_failed + test_errors + tests_skipped
 
-    passed = (
-        tests_collected > 0
-        and tests_failed == 0
-        and test_errors == 0
-        and collection_errors == 0
+    passed, error_type = _apply_success_rule(
+        tests_collected=tests_collected,
+        tests_failed=tests_failed,
+        test_errors=test_errors,
+        collection_errors=collection_errors,
+        test_failures=test_failures,
+        stderr=stderr,
     )
 
-    error_type = None
-    if not passed:
-        if tests_collected == 0 and collection_errors == 0:
-            error_type = "NoTestsCollected"
-        else:
-            blob = "\n".join(f.get("message", "") for f in test_failures) + "\n" + stderr
-            error_type = classify_error(blob) or "TestFailure"
-
-    return TestResults(
+    return _build_test_results(
         passed=passed,
         stdout=stdout,
         stderr=stderr,
         exit_code=exit_code,
         execution_time=execution_time,
         error_type=error_type,
-        failed_tests=failed_names,
+        failed_names=failed_names,
         tests_collected=tests_collected,
         tests_passed=tests_passed,
         tests_failed=tests_failed,
         tests_errors=test_errors + collection_errors,
         test_failures=test_failures,
-        from_pytest=True,
     )
 
 

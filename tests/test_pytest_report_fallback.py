@@ -107,7 +107,7 @@ class TestJUnitParser:
         assert r.tests_collected == 0
         assert r.error_type == "NoTestsCollected"
 
-    def test_skipped_count_toward_collected_not_passed(self):
+    def test_skipped_counts_toward_collected_and_passes_gate(self):
         # An all-skipped suite is collected (so it is NOT "NoTestsCollected"),
         # but skipped tests are neither passes nor failures. This mirrors the
         # JSON path, which takes `collected` from pytest's summary (skipped
