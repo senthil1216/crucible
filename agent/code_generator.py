@@ -2,11 +2,12 @@
 Code Generator: Generates code based on plans.
 """
 
+import ast
 import re
 from typing import Optional, Protocol
 
 from agent.models import Plan, CodeArtifact
-from agent.test_generator import MODULE_NAME
+from agent.test_generator import MODULE_NAME, is_test_module_path
 
 
 class LLMClient(Protocol):
@@ -442,18 +443,141 @@ my-cli --name Alice
 
         return "\n".join(cleaned_lines).strip()
     
+    # A "# path/to/file.ext" comment on its own line — how LLMs delimit several
+    # "files" inside one code block (e.g. "# solution.py", "# test_solution.py",
+    # "# requirements.txt").
+    _FILE_HEADER_RE = re.compile(r'(?m)^[ \t]*#[ \t]*([\w./\-]+\.[A-Za-z0-9]+)[ \t]*$')
+
     def _extract_code(self, text: str) -> str:
-        """Extract code from markdown code blocks or raw text."""
-        # Try to extract from markdown code blocks
-        pattern = r'```(?:\w+)?\s*\n(.*?)\n```'
-        matches = re.findall(pattern, text, re.DOTALL)
-        
-        if matches:
-            # Return the first (and likely only) code block
-            return matches[0].strip()
-        
-        # No code blocks found, return stripped text
-        return text.strip()
+        """Extract the *implementation* from an LLM response.
+
+        Single-file Python tasks ship a frozen test suite separately, but the
+        model often returns the implementation, its own pytest tests, and even a
+        `# requirements.txt` blob in one response (sometimes in one fenced block
+        delimited by `# filename` comments). Writing all of that to `solution.py`
+        pollutes collection (the embedded tests get collected too) and breaks
+        imports. This keeps only the implementation module.
+        """
+        blocks = re.findall(r'```(?:\w+)?\s*\n(.*?)\n```', text, re.DOTALL)
+        candidates = [b.strip() for b in blocks] if blocks else [text.strip()]
+        return self._select_implementation(candidates).strip()
+
+    def _select_implementation(self, candidates: list[str]) -> str:
+        """Pick the implementation out of one or more candidate code chunks.
+
+        Splits each chunk into `# filename`-delimited sections (with any leading
+        preamble as an unnamed section), then considers them in priority order:
+        the `solution` module first, then other implementation-like sections
+        (unnamed, or a non-test `.py`). For each, embedded tests are stripped and
+        the result is accepted only if real implementation code remains — so a
+        section that is *only* tests (even one labelled `# solution.py`) is never
+        emitted. Falls back to the first non-empty candidate so plain
+        single-impl responses are unchanged.
+        """
+        primary: list[str] = []     # solution-named sections
+        secondary: list[str] = []   # other implementation-like sections
+        for chunk in candidates:
+            for name, content in (self._split_file_sections(chunk) or [(None, chunk)]):
+                if not content.strip():
+                    continue
+                if name == f"{MODULE_NAME}.py":
+                    primary.append(content)
+                elif name is None or (name.endswith(".py") and not is_test_module_path(name)):
+                    secondary.append(content)
+                # Named test files and non-Python data files (requirements.txt,
+                # etc.) are intentionally dropped.
+
+        for content in primary + secondary:
+            impl = self._strip_embedded_tests(content)
+            if self._has_real_code(impl):
+                return impl
+
+        # Nothing looked like an implementation — return the first non-empty
+        # candidate unchanged rather than silently dropping the model's output.
+        for chunk in candidates:
+            if chunk.strip():
+                return chunk
+        return ""
+
+    def _split_file_sections(self, block: str) -> list[tuple[Optional[str], str]]:
+        """Split a block into (filename | None, content) on `# filename` headers.
+
+        Returns [] when the block has no file headers. Content before the first
+        header is returned as an unnamed (None) section so a leading
+        implementation followed by a `# requirements.txt` tail is preserved.
+        """
+        matches = list(self._FILE_HEADER_RE.finditer(block))
+        if not matches:
+            return []
+        sections: list[tuple[Optional[str], str]] = []
+        preamble = block[: matches[0].start()].strip("\n")
+        if preamble.strip():
+            sections.append((None, preamble))
+        for i, m in enumerate(matches):
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(block)
+            sections.append((m.group(1), block[start:end].strip("\n")))
+        return sections
+
+    @staticmethod
+    def _imports_pytest(node: ast.AST) -> bool:
+        if isinstance(node, ast.Import):
+            return any(a.name.split(".")[0] == "pytest" for a in node.names)
+        if isinstance(node, ast.ImportFrom):
+            return (node.module or "").split(".")[0] == "pytest"
+        return False
+
+    @classmethod
+    def _is_test_node(cls, node: ast.AST) -> bool:
+        """A top-level node that is part of a test suite, not the implementation."""
+        return (
+            (isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
+            or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+            or cls._imports_pytest(node)
+        )
+
+    def _has_real_code(self, src: str) -> bool:
+        """True if `src` has any top-level statement that is not a test node.
+
+        "Real" is defined broadly — anything that is not a `test_*`/`Test*`/pytest
+        node counts (imports, `if __name__`, module-level expressions, defs,
+        assignments). Unparsable but non-empty source is treated as real (we
+        can't prove it is tests-only). Empty source is not real.
+        """
+        if not src.strip():
+            return False
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return True
+        return any(not self._is_test_node(node) for node in tree.body)
+
+    def _strip_embedded_tests(self, src: str) -> str:
+        """Remove top-level `test_*` functions, `Test*` classes, and `pytest`
+        imports from an implementation — but only when real implementation code
+        remains, so a genuine impl is never nuked.
+
+        Defensive: any parsing/line-bookkeeping problem returns `src` unchanged
+        rather than failing the whole generation (the pre-fix fallback for
+        unparsable responses)."""
+        try:
+            tree = ast.parse(src)
+            test_nodes = [n for n in tree.body if self._is_test_node(n)]
+            has_real = any(not self._is_test_node(n) for n in tree.body)
+            if not test_nodes or not has_real:
+                return src
+            lines = src.splitlines()
+            drop: set[int] = set()  # 1-indexed line numbers to remove
+            for node in test_nodes:
+                start = node.lineno
+                for dec in getattr(node, "decorator_list", []):
+                    start = min(start, dec.lineno)
+                end = node.end_lineno or node.lineno
+                drop.update(range(start, end + 1))
+            kept = [ln for i, ln in enumerate(lines, start=1) if i not in drop]
+            return "\n".join(kept).strip("\n")
+        except Exception:
+            return src
     
     async def generate_fix(
         self,

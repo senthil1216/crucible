@@ -22,6 +22,7 @@ import time
 
 from agent.models import CodeArtifact, TestResults, AgentConfig
 from agent.safety.checker import SafetyChecker
+from agent.test_generator import is_test_module_path
 from agent.pytest_report import (
     build_test_results_preferring_json,
     json_report_available,
@@ -48,15 +49,12 @@ def _apply_rlimits(cpu_seconds: int) -> None:
 
 
 def _is_test_path(rel_path: str) -> bool:
-    """True for files that are part of the test suite (not implementation)."""
-    name = Path(rel_path).name
-    parts = Path(rel_path).parts
-    return (
-        "tests" in parts
-        or name.startswith("test_")
-        or name.endswith("_test.py")
-        or name == "conftest.py"
-    )
+    """True for files that are part of the test suite (not implementation).
+
+    Delegates to the shared `is_test_module_path` so the executors and the code
+    generator agree on what counts as a test file.
+    """
+    return is_test_module_path(rel_path)
 
 
 @dataclass
