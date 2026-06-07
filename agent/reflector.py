@@ -96,6 +96,16 @@ Respond in valid JSON only:
 
 If no useful prediction can be made, return {"predictions": []}."""
 
+    # Failures from the test scaffolding rather than the code under test. A
+    # prediction about these can't be reproduced by calling the function, so
+    # emitting one only pollutes prediction memory with guaranteed-Off-topic
+    # noise (and skews the calibration report).
+    NON_REPLAYABLE_FAILURES = frozenset({
+        "NoTestsCollected", "ReportParseError", "TestGenerationError",
+        "ModuleNotFoundError", "ImportError", "SyntaxError", "IndentationError",
+        "TabError", "TimeoutError", "SafetyError", "UnsupportedLanguage",
+    })
+
     def __init__(
         self,
         llm: LLMClient,
@@ -105,6 +115,27 @@ If no useful prediction can be made, return {"predictions": []}."""
         self.llm = llm
         self.failure_memory = failure_memory
         self.prediction_memory = prediction_memory
+
+    @classmethod
+    def _failure_is_replayable(cls, results: TestResults) -> bool:
+        """True when a failure is a genuine test failure (real tests ran and
+        failed in the code under test) rather than a harness/scaffolding error.
+
+        Only replayable failures are worth turning into predictions: the replay
+        engine reproduces a failure by calling the function on a literal, which
+        can't reproduce collection errors, missing modules, generation failures,
+        timeouts, or an empty suite.
+        """
+        if results.passed:
+            return False
+        if (results.error_type or "") in cls.NON_REPLAYABLE_FAILURES:
+            return False
+        # A real pytest run must have collected at least one test. (Legacy /
+        # non-pytest results report tests_collected == 0 and are not part of the
+        # replay path, so don't gate them on collection count.)
+        if getattr(results, "from_pytest", False) and getattr(results, "tests_collected", 0) <= 0:
+            return False
+        return True
     
     async def analyze(
         self,
@@ -196,7 +227,7 @@ If no useful prediction can be made, return {"predictions": []}."""
         # extraction out of the main reflection prompt avoids regressing
         # reflection quality with extra format pressure.
         if (
-            not test_results.passed
+            self._failure_is_replayable(test_results)
             and self.prediction_memory is not None
             and reflection.failure_id
         ):
@@ -540,8 +571,9 @@ If no useful prediction can be made, return {"predictions": []}."""
                 source_goal=plan.goal,
                 language=getattr(plan, "language", "python"),
             )
-            # Strict schema gate — falsifiability requires a concrete input
-            # and a predicted error type. Drop anything else.
-            if pred.is_well_formed():
+            # Strict gate — keep only predictions the replay engine can actually
+            # score: a concrete literal trigger and a runtime exception type.
+            # Anything else would just accrue Off-topic verdicts.
+            if pred.is_replayable():
                 predictions.append(pred)
         return predictions

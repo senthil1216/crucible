@@ -7,8 +7,18 @@ from typing import Optional, List, Dict, Any, Literal
 from enum import Enum
 from datetime import datetime
 from pathlib import Path
+import ast
 import hashlib
 import json
+
+
+# Exception types that cannot be reproduced by *calling* an already-valid
+# function on a literal input — they happen at import/compile time, so a
+# prediction about them can never be Confirmed by the replay engine.
+_NON_REPLAYABLE_ERROR_TYPES = frozenset({
+    "ImportError", "ModuleNotFoundError", "SyntaxError",
+    "IndentationError", "TabError",
+})
 
 
 class Status(Enum):
@@ -306,6 +316,28 @@ class Prediction:
             and isinstance(self.predicted_error_type, str)
             and self.predicted_error_type.strip()
         )
+
+    def is_replayable(self) -> bool:
+        """Stricter than `is_well_formed`: the prediction must be one the replay
+        engine can actually score, so storing it yields a real Confirmed/
+        Falsified verdict rather than guaranteed Off-topic noise.
+
+        Requirements:
+          - well-formed (concrete trigger + predicted type);
+          - `trigger_input` parses as a Python literal — the replay driver feeds
+            it through `ast.literal_eval`, so anything else is Off-topic;
+          - `predicted_error_type` is a bare identifier naming a *runtime*
+            exception (import/compile-time errors can't arise from calling
+            already-valid code).
+        """
+        if not self.is_well_formed():
+            return False
+        try:
+            ast.literal_eval(self.trigger_input)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return False
+        etype = self.predicted_error_type.strip()
+        return etype.isidentifier() and etype not in _NON_REPLAYABLE_ERROR_TYPES
 
     def confirmation_rate(self) -> float:
         """Laplace-smoothed rate. Defaults to 0.5 with no replay history."""
