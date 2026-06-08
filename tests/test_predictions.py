@@ -260,8 +260,10 @@ class TestReflectorExtractPredictions:
 
     @pytest.mark.asyncio
     async def test_caps_at_three(self):
+        # Literal triggers so each is replayable; the cap (raw_items[:3]) is
+        # what limits the result, not the replayability gate.
         items = [
-            {"trigger_input": f"x{i}", "predicted_error_type": "ValueError"}
+            {"trigger_input": f"{i}", "predicted_error_type": "ValueError"}
             for i in range(10)
         ]
         llm = StubPredictionLLM(json.dumps({"predictions": items}))
